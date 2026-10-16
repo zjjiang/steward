@@ -1,0 +1,12 @@
+# 通用忽略（后续按技术栈补充）
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+build/
+__pycache__/
+.venv/
+*.log
