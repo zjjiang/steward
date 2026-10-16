@@ -1,7 +1,7 @@
 """Steward MCP server（stdio）——龙虾背后的生活管家。
 
-本层只提供通用生活流水工具（兜底通道，零领域校验）；
-各生活模块（fitness/diet/body/commute）的专用工具在后续 change 中加入。
+通用生活流水工具（兜底通道，零领域校验）+ 各生活模块的专用工具。
+当前模块：fitness（运动 + 目标）。新模块在 app/modules/ 下实现并在本文件注册。
 """
 
 from datetime import datetime
@@ -10,21 +10,31 @@ from zoneinfo import ZoneInfo
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
+from app.modules import fitness
 from app.store.db import connect, init_db
 from app.store.events import DEFAULT_LIST_LIMIT, insert_event, list_events
+from app.store.goals import VALID_METRICS, VALID_PERIODS, create_goal_superseding, get_goal
 
 TZ = ZoneInfo("Asia/Shanghai")
 
-INSTRUCTIONS = """Steward —— 个人生活管家（通用生活流水层）。
+INSTRUCTIONS = """Steward —— 个人生活管家。
 
-你（龙虾）负责把用户的自然语言解析成结构化数据，再调用这里的工具落库：
-- log_event：记录一条生活事件。type 为事件类型（如 workout/meal/body/commute，
-  或任意自定义类型）；payload 必须是 JSON object，字段由该类型的约定决定；
+你（龙虾）负责把用户的自然语言解析成结构化数据，再调用这里的工具落库。
+优先用各模块的专用工具；不认识的类型走通用兜底，不要拒绝用户。
+
+【fitness 模块】
+- log_workout：记录运动。sport 必填（run/swim/gym/cycle/hike/ball 等，跟随用户用词）；
+  duration_min（分钟）与 distance_km（公里）至少其一；notes 可选。
+- query_workouts：运动明细 + 汇总（次数/总时长/总距离/按 sport 分组）。
+- set_goal：设定周期型运动目标。metric: distance(公里)/frequency(次数)/duration(分钟)；
+  period: week/month；target 为数值。例："这个月目标跑 50km" →
+  set_goal(metric="distance", target=50, period="month")。
+- goal_progress：目标完成度（target/current/remaining + ahead/on_track/behind）。
+
+【通用兜底】
+- log_event：记录任意类型生活事件。type 为事件类型；payload 必须是 JSON object；
   raw_text 传用户原话，会永久保留。
 - query_events：按 type 与日期窗口查询事件明细（倒序），不做汇总统计。
-
-本层是通用兜底：不认识的 type 也允许记录，不要因为类型不熟悉而拒绝用户。
-各生活模块的专用工具（log_workout/query_workouts 等）由后续版本提供。
 """
 
 
@@ -109,6 +119,133 @@ def query_events(
         )
     finally:
         conn.close()
+
+
+# ---------- fitness 模块 ----------
+
+
+def _module_conn(conn):
+    return conn
+
+
+@mcp.tool
+def log_workout(
+    sport: str,
+    duration_min: float | None = None,
+    distance_km: float | None = None,
+    notes: str | None = None,
+    occurred_at: str | None = None,
+    raw_text: str | None = None,
+) -> dict:
+    """记录一次运动。
+
+    Args:
+        sport: 运动类型（run/swim/gym/cycle/hike/ball 等，跟随用户用词）
+        duration_min: 运动时长（分钟），与 distance_km 至少其一
+        distance_km: 距离（公里），与 duration_min 至少其一
+        notes: 备注（如"练胸和肩"）
+        occurred_at: 发生时间（ISO 8601），缺省取当前时间
+        raw_text: 用户原话，永久保留
+    """
+    payload: dict = {"sport": sport}
+    if duration_min is not None:
+        payload["duration_min"] = duration_min
+    if distance_km is not None:
+        payload["distance_km"] = distance_km
+    if notes is not None:
+        payload["notes"] = notes
+    try:
+        payload = fitness.validate_payload(payload)
+    except ValueError as e:
+        raise ToolError(str(e))
+    occurred = _normalize_occurred_at(occurred_at)
+    conn = get_conn()
+    try:
+        return insert_event(
+            conn, type="workout", payload=payload, raw_text=raw_text, occurred_at=occurred
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool
+def query_workouts(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int = DEFAULT_LIST_LIMIT,
+) -> dict:
+    """查询运动明细与汇总（次数/总时长/总距离/按 sport 分组），按时间倒序。
+
+    Args:
+        date_from: 起始日期（含，YYYY-MM-DD），缺省最近 30 天
+        date_to: 结束日期（含，YYYY-MM-DD）
+        limit: 明细条数上限
+    """
+    conn = get_conn()
+    try:
+        result = list_events(
+            conn, type="workout", date_from=date_from, date_to=date_to, limit=limit
+        )
+    finally:
+        conn.close()
+    result["summary"] = fitness.summarize(result["items"])
+    return result
+
+
+@mcp.tool
+def set_goal(metric: str, target: float, period: str) -> dict:
+    """设定周期型运动目标（同维度重复设定会自动替代旧目标）。
+
+    Args:
+        metric: distance（公里）/ frequency（次数）/ duration（分钟）
+        target: 目标数值（> 0），如月跑量 50 → 50
+        period: week / month
+    """
+    if metric not in VALID_METRICS:
+        raise ToolError(f"metric 只支持 {'/'.join(VALID_METRICS)}，收到 {metric!r}")
+    if period not in VALID_PERIODS:
+        raise ToolError(f"period 只支持 {'/'.join(VALID_PERIODS)}，收到 {period!r}")
+    if isinstance(target, bool) or not isinstance(target, (int, float)) or target <= 0:
+        raise ToolError("target 必须是大于 0 的数值")
+    conn = get_conn()
+    try:
+        return create_goal_superseding(conn, metric=metric, target=target, period=period)
+    finally:
+        conn.close()
+
+
+@mcp.tool
+def goal_progress(goal_id: int) -> dict:
+    """查询目标进度：target/current/remaining、周期起止、ahead/on_track/behind 判定。
+
+    Args:
+        goal_id: set_goal 返回的目标 id
+    """
+    conn = get_conn()
+    try:
+        goal = get_goal(conn, goal_id)
+        if goal is None:
+            raise ToolError("目标不存在")
+        if goal["status"] == "superseded":
+            ref_date = _date_of(goal["created_at"])
+            result = fitness.progress(goal, _workouts(conn), ref_date=ref_date)
+            successor = get_goal(conn, goal["superseded_by"]) if goal["superseded_by"] else None
+            result["status"] = "superseded"
+            result["superseded_by"] = goal["superseded_by"]
+            result["successor_active"] = bool(successor and successor["status"] == "active")
+            return result
+        return fitness.progress(goal, _workouts(conn))
+    finally:
+        conn.close()
+
+
+def _date_of(iso_text: str):
+    return datetime.fromisoformat(iso_text).date()
+
+
+def _workouts(conn) -> list[dict]:
+    # 目标周期最长一个月，全部拉回内存交给纯函数计算
+    return list_events(conn, type="workout", limit=10000)["items"]
 
 
 if __name__ == "__main__":

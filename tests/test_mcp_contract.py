@@ -107,3 +107,125 @@ class TestInstructions:
         async with Client(mcp) as client:
             instructions = client.instructions
         assert instructions and "log_event" in instructions
+
+
+class TestLogWorkout:
+    async def test_log_success(self, isolated_db):
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            data = await call(
+                client,
+                "log_workout",
+                {"sport": "run", "distance_km": 8, "raw_text": "今天跑了 8km"},
+            )
+        assert data["type"] == "workout"
+        assert data["payload"]["distance_km"] == 8
+
+    async def test_no_quantitative_field_rejected(self, isolated_db):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="duration_min"):
+                await call(client, "log_workout", {"sport": "run"})
+
+    async def test_negative_rejected(self, isolated_db):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="distance_km"):
+                await call(client, "log_workout", {"sport": "run", "distance_km": -3})
+
+
+class TestQueryWorkouts:
+    async def test_summary_aggregation(self, isolated_db):
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            await call(client, "log_workout", {"sport": "run", "distance_km": 8, "duration_min": 40})
+            await call(client, "log_workout", {"sport": "run", "distance_km": 9, "duration_min": 45})
+            await call(client, "log_workout", {"sport": "gym", "duration_min": 60})
+            data = await call(client, "query_workouts", {})
+        assert data["summary"]["count"] == 3
+        assert data["summary"]["total_distance_km"] == 17
+        assert data["summary"]["total_duration_min"] == 145
+        assert data["summary"]["by_sport"]["run"]["count"] == 2
+
+    async def test_excludes_other_types(self, isolated_db):
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            await call(client, "log_event", {"type": "meal", "payload": {"desc": "麻辣烫"}})
+            await call(client, "log_workout", {"sport": "run", "distance_km": 5})
+            data = await call(client, "query_workouts", {})
+        assert data["total"] == 1
+
+
+class TestGoals:
+    async def test_set_goal_success(self, isolated_db):
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            data = await call(
+                client, "set_goal", {"metric": "distance", "target": 50, "period": "month"}
+            )
+        assert data["status"] == "active"
+        assert data["kind"] == "workout"
+
+    async def test_same_dimension_supersedes(self, isolated_db):
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            old = await call(
+                client, "set_goal", {"metric": "distance", "target": 50, "period": "month"}
+            )
+            new = await call(
+                client, "set_goal", {"metric": "distance", "target": 80, "period": "month"}
+            )
+        assert new["status"] == "active"
+        assert new["superseded_id"] == old["id"]
+
+    async def test_invalid_metric_rejected(self, isolated_db):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="metric"):
+                await call(client, "set_goal", {"metric": "calories", "target": 100, "period": "month"})
+
+    async def test_goal_progress_on_track(self, isolated_db):
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            goal = await call(
+                client, "set_goal", {"metric": "distance", "target": 50, "period": "month"}
+            )
+            await call(client, "log_workout", {"sport": "run", "distance_km": 25})
+            data = await call(client, "goal_progress", {"goal_id": goal["id"]})
+        assert data["current"] == 25
+        assert data["verdict"] in ("on_track", "ahead")  # 视当天日期而定，月初强制 on_track
+
+    async def test_goal_progress_missing(self, isolated_db):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="目标不存在"):
+                await call(client, "goal_progress", {"goal_id": 999})
+
+    async def test_goal_progress_superseded_annotated(self, isolated_db):
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            old = await call(
+                client, "set_goal", {"metric": "distance", "target": 50, "period": "month"}
+            )
+            new = await call(
+                client, "set_goal", {"metric": "distance", "target": 80, "period": "month"}
+            )
+            data = await call(client, "goal_progress", {"goal_id": old["id"]})
+        assert data["status"] == "superseded"
+        assert data["superseded_by"] == new["id"]
+

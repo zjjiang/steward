@@ -26,8 +26,10 @@ class TestInitDb:
         assert {"events", "schema_version"} <= tables
 
     def test_schema_version_written(self, conn):
-        (version,) = conn.execute("SELECT version FROM schema_version").fetchone()
-        assert version == 1
+        from app.store.db import SCHEMA_VERSION
+
+        (version,) = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        assert version == SCHEMA_VERSION
 
     def test_reinit_idempotent(self, conn):
         insert_event(conn, type="note", payload={"a": 1})

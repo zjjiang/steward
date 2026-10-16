@@ -38,6 +38,29 @@ async def main() -> None:
         assert queried.data["items"][0]["raw_text"] == marker, "原话应原样保留"
         print("query_events → total=1, 原话追溯 OK")
 
+        # fitness 模块：记录 → 汇总 → 目标 → 进度
+        await client.call_tool(
+            "log_workout", {"sport": "run", "distance_km": 9, "duration_min": 45}
+        )
+        await client.call_tool("log_workout", {"sport": "gym", "duration_min": 60})
+        summary = (await client.call_tool("query_workouts", {})).data["summary"]
+        assert summary["count"] == 3, "应有 3 次运动"
+        assert summary["total_distance_km"] == 17, "总距离应为 17km"
+        print(f"query_workouts → count=3, distance=17km, by_sport={list(summary['by_sport'])}")
+
+        goal = (
+            await client.call_tool(
+                "set_goal", {"metric": "distance", "target": 50, "period": "month"}
+            )
+        ).data
+        progress = (await client.call_tool("goal_progress", {"goal_id": goal["id"]})).data
+        assert progress["current"] == 17, "目标进度应为 17km"
+        assert progress["verdict"] in ("ahead", "on_track", "behind")
+        print(
+            f"goal_progress → current={progress['current']}/50, "
+            f"remaining={progress['remaining']}, verdict={progress['verdict']}"
+        )
+
     print("smoke passed ✅")
 
 
