@@ -7,7 +7,7 @@
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_DB_PATH = _REPO_ROOT / "data" / "steward.db"
@@ -26,6 +26,19 @@ CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(type, occurred_at);
 CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER NOT NULL
 );
+
+-- v2: mod-fitness 周期型目标
+CREATE TABLE IF NOT EXISTS goals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL DEFAULT 'workout',
+  metric TEXT NOT NULL,
+  target REAL NOT NULL,
+  period TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  superseded_by INTEGER REFERENCES goals(id),
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_goals_lookup ON goals(kind, metric, period, status);
 """
 
 
@@ -46,9 +59,14 @@ def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """建表（幂等）。schema_version 只在为空时写入。"""
+    """建表（幂等）。空库写入当前版本号；旧库版本号向上升级。"""
     conn.executescript(_SCHEMA)
     (count,) = conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()
     if count == 0:
         conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
-    conn.commit()
+        conn.commit()
+        return
+    (version,) = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    if version < SCHEMA_VERSION:
+        conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
+        conn.commit()
