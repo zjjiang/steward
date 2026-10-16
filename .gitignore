@@ -10,3 +10,15 @@ build/
 __pycache__/
 .venv/
 *.log
+
+# Python / venv
+.venv/
+__pycache__/
+*.egg-info/
+.ruff_cache/
+.pytest_cache/
+.coverage
+
+# 本地数据
+/data/*.db
+/data/*.db-journal

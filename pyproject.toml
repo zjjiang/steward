@@ -1,0 +1,22 @@
+[project]
+name = "steward"
+version = "0.1.0"
+description = "个人生活管家 —— Finance + Fitness，Deputy 的事业助手对应的生活侧"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=2.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
