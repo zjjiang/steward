@@ -61,6 +61,23 @@ async def main() -> None:
             f"remaining={progress['remaining']}, verdict={progress['verdict']}"
         )
 
+        # diet / body / commute 三模块
+        await client.call_tool("log_meal", {"desc": "麻辣烫", "meal": "lunch", "cost": 28})
+        meal_summary = (await client.call_tool("query_meals", {})).data["summary"]
+        assert meal_summary["count"] == 1 and meal_summary["total_cost"] == 28
+        print(f"query_meals → count={meal_summary['count']}, cost={meal_summary['total_cost']}")
+
+        await client.call_tool("log_body", {"weight_kg": 62.5})
+        body_summary = (await client.call_tool("query_body", {})).data["summary"]
+        assert body_summary["series"][-1]["weight_kg"] == 62.5 and body_summary["change"] is None
+        print(f"query_body → series={body_summary['series']}, change={body_summary['change']}")
+
+        await client.call_tool("check_in", {"direction": "in"})
+        await client.call_tool("check_in", {"direction": "out"})
+        commute_summary = (await client.call_tool("query_commute", {})).data["summary"]
+        assert commute_summary["days"] == 1 and commute_summary["in_count"] == 1
+        print(f"query_commute → {commute_summary}")
+
     print("smoke passed ✅")
 
 
