@@ -18,4 +18,4 @@
 
 - [x] 3.1 全量测试绿（uv run pytest -q）+ ruff 无告警
 - [x] 3.2 stdio 冒烟：起 server，用 FastMCP client stdio 完成"记录 → 查询 → 原话追溯"全链路
-- [ ] 3.3 更新 README 运行说明（启动命令、龙虾接入配置示例），提交 PR
+- [x] 3.3 更新 README 运行说明（启动命令、龙虾接入配置示例），提交 PR
