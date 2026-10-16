@@ -4,13 +4,20 @@
 > 第一阶段只做 **Finance + Fitness**，Review（周/月复盘）是核心场景。
 > 产品需求见 `docs/PRD-第一阶段.md` —— 判断任何功能取舍前先读它。
 
-## 已定架构决策（2026-10-16）
+## 已定架构（2026-10-16 确认）
 
-- **交互**：MCP 分身 + Claude Code 双通道。FastMCP server 供龙虾/dodo 等微信分身
-  和本地 Claude Code 接入；用户自然语言输入（"今天跑了 8 公里"），Steward 负责结构化。
+```
+龙虾（OpenClaw）—— 脑子在龙虾侧，Steward 不配 AI、不烧 token
+   ├── MCP stdio → deputy      事业助手
+   └── MCP stdio → steward     生活管家（本项目）
+                       └── MCP → credi-insights   财务数据源
+```
+
+- **交互**：Steward 是 OpenClaw（龙虾）背后的纯逻辑后端，同 Deputy 模式。
+  龙虾经 MCP stdio 接入；用户微信自然语言输入（"今天跑了 8 公里"），Steward 负责结构化。
 - **技术栈**：Python 3.12+ / FastAPI + SQLite（`data/steward.db`，.gitignore）+ FastMCP，包管理用 `uv`。
-- **Finance 数据**：**只走 credi-insights 的 MCP server**（`credi-insights/mcp-server.ts`），
-  禁止直连其 MySQL，禁止复制数据到本地。
+- **Finance 数据**：Steward 作为 MCP client 挂载 credi-insights 的 `mcp-server.ts`（stdio），
+  在其数据之上封装分析工具。**禁止直连其 MySQL，禁止复制数据到本地。**
 - **Fitness 数据**：Steward 自有 SQLite 库。
 
 ## 开发流程（强制，三条铁律）

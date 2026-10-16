@@ -155,12 +155,23 @@ Steward 要能发现趋势：
 
 ---
 
-## 7. 已定决策（2026-10-16）
+## 7. 已定架构（2026-10-16 确认）
 
-- **交互形态**：MCP 分身 + Claude Code 双通道。Steward 提供 MCP server，微信分身
-  （龙虾/dodo 等）与本地 Claude Code 都可直接对话记录和提问。输入成本是生死线。
-- **技术栈**：Python（FastAPI + SQLite + FastMCP），对齐 Deputy，运维经验直接复用。
-- **Finance 数据接入**：走 credi-insights 已有的 MCP server（`mcp-server.ts`），
-  Steward 不直连其数据库、不复制数据。
-- **Fitness 数据存储**：Steward 自有 SQLite 库。
-- **开发流程**：沿用 OpenSpec + TDD 门禁（对齐 Deputy / credi-insights 惯例）。
+```
+你（微信）
+   │
+龙虾（OpenClaw）—— 脑子在这里，大模型与 token 都在龙虾侧
+   │
+   ├── MCP stdio → deputy        事业助手（工作/项目/学习）
+   └── MCP stdio → steward       生活管家（Finance + Fitness）
+                       │
+                       └── MCP → credi-insights   财务数据源（背后的上游）
+```
+
+- **与 OpenClaw 联动**：Steward 是龙虾背后的纯逻辑后端（同 Deputy 模式），
+  本身不配 AI、不烧 token。微信自然语言输入，龙虾经 MCP 调 Steward 记录/查询/复盘。
+- **技术栈**：Python 3.12 + FastMCP(stdio) + SQLite + uv + pytest + ruff，完全对齐 Deputy。
+- **Finance 数据**：Steward 作为 MCP client 挂载 credi-insights 的 `mcp-server.ts`，
+  Finance 分析工具在其数据之上封装。**不直连其 MySQL，不复制数据**（同 Deputy↔feed-curator 关系）。
+- **Fitness 数据**：Steward 自有 SQLite 库（`data/steward.db`，数据不出墙）。
+- **开发流程**：OpenSpec + TDD + PR 门禁（对齐 Deputy / credi-insights 惯例）。
