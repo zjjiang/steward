@@ -3,6 +3,9 @@
 覆盖成功路径与错误消息（对齐 Deputy 的 MCP 契约测试模式）。
 """
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import pytest
 
 from app.mcp_server import mcp
@@ -310,4 +313,243 @@ class TestCommute:
         async with Client(mcp) as client:
             with pytest.raises(ToolError, match="direction"):
                 await call(client, "check_in", {"direction": "home"})
+
+
+# ---------- finance 模块（fake backend 注入，零子进程） ----------
+
+
+def _recent_months(n):
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    out = []
+    for i in range(n):
+        total = now.year * 12 + now.month - 1 - i
+        out.append(f"{total // 12:04d}-{total % 12 + 1:02d}")
+    return sorted(out)
+
+
+def _fin_tx(id, merchant, amount, date, time=None, type="DEBIT", card="0094", category_id=None):
+    return {
+        "id": id, "txDate": date, "txTime": time, "merchant": merchant,
+        "amount": amount, "type": type, "cardLast4": card,
+        "categoryId": category_id,
+        "category": {"name": "餐饮", "icon": "🍜"} if category_id else None,
+    }
+
+
+def _fin_stats(card_id, debit, count=1):
+    return {
+        "period": "", "cardId": card_id, "totalDebit": debit, "totalCredit": 0,
+        "netSpending": debit, "transactionCount": count, "categoryBreakdown": [],
+    }
+
+
+class FakeFinanceBackend:
+    def __init__(self):
+        self.responses = {}
+        self.calls = []
+
+    async def call(self, tool, arguments=None):
+        self.calls.append((tool, arguments))
+        response = self.responses.get(tool)
+        if isinstance(response, Exception):
+            raise response
+        if callable(response):
+            return response(arguments or {})
+        return response
+
+
+@pytest.fixture
+def finance_backend(monkeypatch):
+    fake = FakeFinanceBackend()
+    monkeypatch.setattr("app.finance.tools.get_backend", lambda: fake)
+    return fake
+
+
+class TestFinanceSummary:
+    async def test_cross_card_merge(self, isolated_db, finance_backend):
+        finance_backend.responses = {
+            "list_cards": [{"id": "c1", "bank": "CMB"}, {"id": "c2", "bank": "SPDB"}],
+            "get_stats": lambda a: _fin_stats(a["cardId"], 100 if a["cardId"] == "c1" else 80.5),
+            "get_transactions": [
+                _fin_tx("t1", "美团", "28.00", "2026-10-05T00:00:00.000Z"),
+                _fin_tx("t2", "滴滴出行", "23.50", "2026-10-06T00:00:00.000Z"),
+            ],
+        }
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            data = await call(client, "spending_summary", {"month": "2026-10"})
+        assert data["month"] == "2026-10"
+        assert data["total_debit"] == 180.5
+        assert data["transaction_count"] == 2
+        assert data["top_merchants"][0] == {"merchant": "美团", "amount": 28.0}
+
+    async def test_bad_month_rejected(self, isolated_db, finance_backend):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="month"):
+                await call(client, "spending_summary", {"month": "十月"})
+            with pytest.raises(ToolError, match="month"):
+                await call(client, "spending_summary", {"month": "2026-13"})
+
+    async def test_upstream_down_translated(self, isolated_db, finance_backend):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        # 真实链路中 backend 已把上游故障转译为本消息（见 test_finance_backend.py）
+        finance_backend.responses = {
+            "list_cards": ToolError("财务数据源不可用：Error: connection refused"),
+        }
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="财务数据源不可用"):
+                await call(client, "spending_summary", {})
+
+
+class TestFinanceTrend:
+    async def test_two_months_with_change(self, isolated_db, finance_backend):
+        months = _recent_months(2)
+        debit_map = {months[0]: 80.0, months[1]: 120.0}
+        finance_backend.responses = {
+            "list_cards": [{"id": "c1"}],
+            "get_stats": lambda a: _fin_stats("c1", debit_map[a["period"]]),
+            "get_transactions": [],
+        }
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            data = await call(client, "spending_trend", {"months": 2})
+        items = data["items"]
+        assert [m["month"] for m in items] == months
+        assert items[0]["total_debit"] == 80.0 and items[0]["change_vs_prev"] is None
+        assert items[1]["total_debit"] == 120.0 and items[1]["change_vs_prev"] == 40.0
+
+    async def test_bad_months_rejected(self, isolated_db, finance_backend):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="months"):
+                await call(client, "spending_trend", {"months": 0})
+            with pytest.raises(ToolError, match="months"):
+                await call(client, "subscriptions", {"months": 13})
+
+
+class TestFinanceSubscriptions:
+    async def test_subscription_detected(self, isolated_db, finance_backend):
+        months = _recent_months(3)
+        by_start = {
+            f"{m}-01": [_fin_tx(f"t{i}", "爱奇艺", "25.00", f"{m}-10T00:00:00.000Z")]
+            for i, m in enumerate(months)
+        }
+        finance_backend.responses = {"get_transactions": lambda a: by_start[a["startDate"]]}
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            data = await call(client, "subscriptions", {"months": 3})
+        subs = data["subscriptions"]
+        assert len(subs) == 1
+        assert subs[0]["merchant"] == "爱奇艺"
+        assert subs[0]["monthly_avg"] == 25.0
+        assert subs[0]["months_count"] == 3
+
+
+class TestFinanceClassification:
+    async def test_auto_classify_defaults_to_dry_run(self, isolated_db, finance_backend):
+        finance_backend.responses = {"apply_rules": {"dryRun": True, "matchedCount": 0, "matches": []}}
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            await call(client, "auto_classify", {})
+        assert finance_backend.calls[-1] == ("apply_rules", {"dryRun": True})
+
+    async def test_auto_classify_execute(self, isolated_db, finance_backend):
+        finance_backend.responses = {"apply_rules": {"dryRun": False, "matchedCount": 2, "matches": []}}
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            await call(client, "auto_classify", {"card_id": "c1", "dry_run": False})
+        assert finance_backend.calls[-1] == ("apply_rules", {"cardId": "c1", "dryRun": False})
+
+    async def test_pending_classifications(self, isolated_db, finance_backend):
+        finance_backend.responses = {
+            "get_transactions": [
+                _fin_tx("t1", "已分类", "28.00", "2026-10-16T00:00:00.000Z", "12:30:00", category_id="cat1"),
+                _fin_tx("t2", "滴滴出行", "23.50", "2026-10-16T00:00:00.000Z", "08:10:00"),
+                _fin_tx("t3", "美团", "28.00", "2026-10-16T00:00:00.000Z", "19:05:00"),
+            ],
+        }
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            data = await call(client, "pending_classifications", {"date": "2026-10-16"})
+        assert data["date"] == "2026-10-16"
+        assert data["count"] == 2
+        assert [i["tx_id"] for i in data["items"]] == ["t2", "t3"]
+        assert finance_backend.calls[-1] == (
+            "get_transactions", {"startDate": "2026-10-16", "endDate": "2026-10-16"},
+        )
+
+    async def test_pending_bad_date_rejected(self, isolated_db, finance_backend):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="date"):
+                await call(client, "pending_classifications", {"date": "10月16日"})
+
+    async def test_create_rule_passthrough(self, isolated_db, finance_backend):
+        finance_backend.responses = {"create_rule": {"id": "r1", "name": "美团→餐饮"}}
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            data = await call(
+                client, "create_rule",
+                {"name": "美团→餐饮", "pattern": "merchant contains 美团", "category_id": "cat1"},
+            )
+        assert data["id"] == "r1"
+        assert finance_backend.calls[-1] == (
+            "create_rule", {"name": "美团→餐饮", "pattern": "merchant contains 美团", "categoryId": "cat1"},
+        )
+
+    async def test_create_rule_missing_fields(self, isolated_db, finance_backend):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="pattern"):
+                await call(client, "create_rule", {"name": "x", "category_id": "cat1"})
+
+    async def test_classify_transaction_passthrough(self, isolated_db, finance_backend):
+        finance_backend.responses = {
+            "update_transaction_category": {"id": "t1", "categoryId": "cat1"},
+        }
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            await call(client, "classify_transaction", {"tx_id": "t1", "category_id": "cat1"})
+        assert finance_backend.calls[-1] == (
+            "update_transaction_category", {"txId": "t1", "categoryId": "cat1"},
+        )
+
+    async def test_sync_card_empty_rejected(self, isolated_db, finance_backend):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="card_id"):
+                await call(client, "sync_card", {"card_id": " "})
+
+    async def test_whitelist_no_create_category(self, isolated_db, finance_backend):
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            names = {t.name for t in await client.list_tools()}
+        assert "create_category" not in names
+        assert {
+            "spending_summary", "spending_trend", "subscriptions", "list_cards",
+            "sync_card", "list_categories", "list_rules", "create_rule",
+            "classify_transaction", "auto_classify", "pending_classifications",
+        } <= names
 
