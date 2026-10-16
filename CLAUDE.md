@@ -27,8 +27,9 @@
 1. **OpenSpec 先行** — `/opsx:propose` 立提案（proposal → specs → design → tasks），
    用户审阅通过前**不动手写代码**。零风险改动（错字/格式）除外。
 2. **TDD** — Red → Green → Refactor，先写失败测试再实现。测试跑 `uv run pytest -q`。
-3. **PR 合入** — 不直推 main。`git switch -c feat/<简述>` → 提交 → `gh pr create` →
-   测试绿 + 用户审阅后合并。一个 OpenSpec change 对应一个分支/PR。
+3. **PR 合入，push 先问** — **任何 git push 之前必须先找用户确认**（docs 改动也不例外），
+   不直推 main。流程：`git switch -c feat/<简述>` → 提交 → **用户确认** → push →
+   `gh pr create` → 测试绿 + 用户审阅后合并。一个 OpenSpec change 对应一个分支/PR。
 
 ## 命令
 
