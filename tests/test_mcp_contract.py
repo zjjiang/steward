@@ -229,3 +229,85 @@ class TestGoals:
         assert data["status"] == "superseded"
         assert data["superseded_by"] == new["id"]
 
+
+class TestDiet:
+    async def test_log_and_query(self, isolated_db):
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            await call(
+                client,
+                "log_meal",
+                {"desc": "麻辣烫", "meal": "lunch", "cost": 28, "raw_text": "中午吃的麻辣烫，28 块"},
+            )
+            await call(client, "log_meal", {"desc": "燕麦", "meal": "breakfast"})
+            data = await call(client, "query_meals", {})
+        assert data["summary"]["count"] == 2
+        assert data["summary"]["total_cost"] == 28
+        assert data["summary"]["by_meal"] == {"lunch": 1, "breakfast": 1}
+        # 倒序：燕麦（后记）在前，麻辣烫（先记、带原话）在后
+        assert data["items"][1]["raw_text"] == "中午吃的麻辣烫，28 块"
+
+    async def test_missing_desc_rejected(self, isolated_db):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="desc"):
+                await call(client, "log_meal", {"cost": 28})
+
+    async def test_invalid_meal_rejected(self, isolated_db):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="meal"):
+                await call(client, "log_meal", {"desc": "夜宵", "meal": "brunch"})
+
+
+class TestBody:
+    async def test_log_and_query_series(self, isolated_db):
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            await call(
+                client,
+                "log_body",
+                {"weight_kg": 62.5, "occurred_at": "2026-10-10T07:00:00", "raw_text": "今天 62.5kg"},
+            )
+            await call(client, "log_body", {"weight_kg": 61.8, "occurred_at": "2026-10-16T07:00:00"})
+            data = await call(client, "query_body", {})
+        assert data["total"] == 2
+        assert data["summary"]["series"][-1] == {"date": "2026-10-16", "weight_kg": 61.8}
+        assert data["summary"]["change"] == pytest.approx(-0.7)
+        assert data["items"][1]["raw_text"] == "今天 62.5kg"
+
+    async def test_invalid_weight_rejected(self, isolated_db):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="weight_kg"):
+                await call(client, "log_body", {"weight_kg": 800})
+
+
+class TestCommute:
+    async def test_check_in_and_query(self, isolated_db):
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            await call(client, "check_in", {"direction": "in"})
+            await call(client, "check_in", {"direction": "out"})
+            data = await call(client, "query_commute", {})
+        assert data["summary"]["days"] == 1
+        assert data["summary"]["in_count"] == 1
+        assert data["summary"]["out_count"] == 1
+
+    async def test_invalid_direction_rejected(self, isolated_db):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="direction"):
+                await call(client, "check_in", {"direction": "home"})
+

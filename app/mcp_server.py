@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
-from app.modules import fitness
+from app.modules import body, commute, diet, fitness
 from app.store.db import connect, init_db
 from app.store.events import DEFAULT_LIST_LIMIT, insert_event, list_events
 from app.store.goals import VALID_METRICS, VALID_PERIODS, create_goal_superseding, get_goal
@@ -30,6 +30,19 @@ INSTRUCTIONS = """Steward —— 个人生活管家。
   period: week/month；target 为数值。例："这个月目标跑 50km" →
   set_goal(metric="distance", target=50, period="month")。
 - goal_progress：目标完成度（target/current/remaining + ahead/on_track/behind）。
+
+【diet 模块】
+- log_meal：记录饮食。desc 必填（吃了什么）；meal 可选（breakfast/lunch/dinner/snack）；
+  cost 可选（元）。例："中午吃的麻辣烫，28 块" → log_meal(desc="麻辣烫", meal="lunch", cost=28)。
+- query_meals：饮食明细 + 汇总（次数/花费合计/按餐次分组）。
+
+【body 模块】
+- log_body：记录体重。weight_kg 必填。例："今天 62.5kg" → log_body(weight_kg=62.5)。
+- query_body：体重序列（升序）+ 首末差值。
+
+【commute 模块】
+- check_in：上下班打卡。direction: in（到岗）/ out（离岗）。
+- query_commute：打卡统计（天数 / in、out 次数）。
 
 【通用兜底】
 - log_event：记录任意类型生活事件。type 为事件类型；payload 必须是 JSON object；
@@ -246,6 +259,177 @@ def _date_of(iso_text: str):
 def _workouts(conn) -> list[dict]:
     # 目标周期最长一个月，全部拉回内存交给纯函数计算
     return list_events(conn, type="workout", limit=10000)["items"]
+
+
+# ---------- diet 模块 ----------
+
+
+@mcp.tool
+def log_meal(
+    desc: str,
+    meal: str | None = None,
+    cost: float | None = None,
+    occurred_at: str | None = None,
+    raw_text: str | None = None,
+) -> dict:
+    """记录一顿饮食。
+
+    Args:
+        desc: 吃了什么
+        meal: 餐次（breakfast/lunch/dinner/snack），可选
+        cost: 花费（元，> 0），可选
+        occurred_at: 发生时间（ISO 8601），缺省取当前时间
+        raw_text: 用户原话，永久保留
+    """
+    payload: dict = {"desc": desc}
+    if meal is not None:
+        payload["meal"] = meal
+    if cost is not None:
+        payload["cost"] = cost
+    try:
+        payload = diet.validate_payload(payload)
+    except ValueError as e:
+        raise ToolError(str(e))
+    occurred = _normalize_occurred_at(occurred_at)
+    conn = get_conn()
+    try:
+        return insert_event(
+            conn, type="meal", payload=payload, raw_text=raw_text, occurred_at=occurred
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool
+def query_meals(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int = DEFAULT_LIST_LIMIT,
+) -> dict:
+    """查询饮食明细与汇总（次数/花费合计/按餐次分组），按时间倒序。
+
+    Args:
+        date_from: 起始日期（含，YYYY-MM-DD），缺省最近 30 天
+        date_to: 结束日期（含，YYYY-MM-DD）
+        limit: 明细条数上限
+    """
+    conn = get_conn()
+    try:
+        result = list_events(
+            conn, type="meal", date_from=date_from, date_to=date_to, limit=limit
+        )
+    finally:
+        conn.close()
+    result["summary"] = diet.summarize(result["items"])
+    return result
+
+
+# ---------- body 模块 ----------
+
+
+@mcp.tool
+def log_body(
+    weight_kg: float,
+    occurred_at: str | None = None,
+    raw_text: str | None = None,
+) -> dict:
+    """记录体重。
+
+    Args:
+        weight_kg: 体重（公斤），(0, 500]
+        occurred_at: 发生时间（ISO 8601），缺省取当前时间
+        raw_text: 用户原话，永久保留
+    """
+    try:
+        payload = body.validate_payload({"weight_kg": weight_kg})
+    except ValueError as e:
+        raise ToolError(str(e))
+    occurred = _normalize_occurred_at(occurred_at)
+    conn = get_conn()
+    try:
+        return insert_event(
+            conn, type="body", payload=payload, raw_text=raw_text, occurred_at=occurred
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool
+def query_body(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int = DEFAULT_LIST_LIMIT,
+) -> dict:
+    """查询体重序列（时间升序，同日取最后）与首末差值。
+
+    Args:
+        date_from: 起始日期（含，YYYY-MM-DD），缺省最近 30 天
+        date_to: 结束日期（含，YYYY-MM-DD）
+        limit: 明细条数上限
+    """
+    conn = get_conn()
+    try:
+        result = list_events(
+            conn, type="body", date_from=date_from, date_to=date_to, limit=limit
+        )
+    finally:
+        conn.close()
+    result["summary"] = body.summarize(result["items"])
+    return result
+
+
+# ---------- commute 模块 ----------
+
+
+@mcp.tool
+def check_in(
+    direction: str,
+    occurred_at: str | None = None,
+    raw_text: str | None = None,
+) -> dict:
+    """上下班打卡。
+
+    Args:
+        direction: in（到岗）/ out（离岗）
+        occurred_at: 打卡时间（ISO 8601），缺省取当前时间
+        raw_text: 用户原话，永久保留
+    """
+    try:
+        payload = commute.validate_payload({"direction": direction})
+    except ValueError as e:
+        raise ToolError(str(e))
+    occurred = _normalize_occurred_at(occurred_at)
+    conn = get_conn()
+    try:
+        return insert_event(
+            conn, type="commute", payload=payload, raw_text=raw_text, occurred_at=occurred
+        )
+    finally:
+        conn.close()
+
+
+@mcp.tool
+def query_commute(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int = DEFAULT_LIST_LIMIT,
+) -> dict:
+    """查询打卡明细与统计（打卡天数 / in、out 次数），按时间倒序。
+
+    Args:
+        date_from: 起始日期（含，YYYY-MM-DD），缺省最近 30 天
+        date_to: 结束日期（含，YYYY-MM-DD）
+        limit: 明细条数上限
+    """
+    conn = get_conn()
+    try:
+        result = list_events(
+            conn, type="commute", date_from=date_from, date_to=date_to, limit=limit
+        )
+    finally:
+        conn.close()
+    result["summary"] = commute.summarize(result["items"])
+    return result
 
 
 if __name__ == "__main__":
