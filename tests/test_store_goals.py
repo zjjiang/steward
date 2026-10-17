@@ -61,3 +61,22 @@ class TestGoalCrud:
         assert get_goal(conn, g1["id"])["superseded_by"] == g2["id"]
         assert get_goal(conn, g2["id"])["superseded_by"] == g3["id"]
         assert get_goal(conn, g3["id"])["status"] == "active"
+
+
+class TestListActiveGoals:
+    def test_empty_db(self, conn):
+        from app.store.goals import list_active_goals
+
+        assert list_active_goals(conn) == []
+
+    def test_returns_active_only(self, conn):
+        from app.store.goals import list_active_goals
+
+        create_goal_superseding(conn, metric="distance", target=50, period="month")
+        create_goal_superseding(conn, metric="distance", target=80, period="month")  # 替代前者
+        create_goal_superseding(conn, metric="frequency", target=12, period="week")
+
+        goals = list_active_goals(conn)
+        assert len(goals) == 2
+        assert {g["metric"] for g in goals} == {"distance", "frequency"}
+        assert all(g["status"] == "active" for g in goals)

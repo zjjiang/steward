@@ -362,6 +362,7 @@ class FakeFinanceBackend:
 def finance_backend(monkeypatch):
     fake = FakeFinanceBackend()
     monkeypatch.setattr("app.finance.tools.get_backend", lambda: fake)
+    monkeypatch.setattr("app.mcp_server.get_backend", lambda: fake)  # review 的 _finance_section
     return fake
 
 
@@ -553,3 +554,80 @@ class TestFinanceClassification:
             "classify_transaction", "auto_classify", "pending_classifications",
         } <= names
 
+
+
+class TestReview:
+    async def test_month_review_success(self, isolated_db, finance_backend):
+        finance_backend.responses = {
+            "get_transactions": [
+                _fin_tx("t1", "美团", "28.00", "2026-10-05T00:00:00.000Z"),
+            ],
+        }
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            await call(client, "log_workout", {
+                "sport": "run", "distance_km": 8, "duration_min": 40,
+                "occurred_at": "2026-10-10T08:00:00",
+            })
+            data = await call(client, "get_review", {"period": "month", "ref_date": "2026-10-16"})
+        assert data["meta"]["start"] == "2026-10-01"
+        assert data["meta"]["end"] == "2026-10-31"
+        assert data["fitness"]["summary"]["count"] == 1
+        assert data["finance"]["available"] is True
+        assert data["finance"]["total_debit"] == 28.0
+        assert "subscriptions" in data["finance"]  # 月度附订阅识别
+
+    async def test_week_review_no_subscriptions(self, isolated_db, finance_backend):
+        finance_backend.responses = {"get_transactions": []}
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            data = await call(client, "get_review", {"period": "week", "ref_date": "2026-10-14"})
+        assert data["meta"]["start"] == "2026-10-12"
+        assert "subscriptions" not in data["finance"]
+
+    async def test_invalid_period_rejected(self, isolated_db, finance_backend):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="period"):
+                await call(client, "get_review", {"period": "day"})
+
+    async def test_invalid_ref_date_rejected(self, isolated_db, finance_backend):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="ref_date"):
+                await call(client, "get_review", {"period": "week", "ref_date": "10月14日"})
+
+    async def test_finance_degraded_but_review_complete(self, isolated_db, finance_backend):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        finance_backend.responses = {
+            "get_transactions": ToolError("财务数据源不可用：Error: spawn ENOENT"),
+        }
+
+        async with Client(mcp) as client:
+            await call(client, "log_workout", {
+                "sport": "run", "distance_km": 5, "occurred_at": "2026-10-10T08:00:00",
+            })
+            data = await call(client, "get_review", {"period": "month", "ref_date": "2026-10-16"})
+        assert data["finance"]["available"] is False
+        assert "财务数据源不可用" in data["finance"]["error"]
+        assert data["fitness"]["summary"]["count"] == 1  # 其余 section 照常
+
+    async def test_empty_period_all_zero(self, isolated_db, finance_backend):
+        finance_backend.responses = {"get_transactions": []}
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            data = await call(client, "get_review", {"period": "week", "ref_date": "2026-10-14"})
+        assert data["fitness"]["summary"]["count"] == 0
+        assert data["diet"]["count"] == 0
+        assert data["commute"]["days"] == 0
+        assert data["other"] == {}
+        assert data["finance"]["available"] is True
