@@ -92,6 +92,14 @@ async def main() -> None:
             f"finance.available={review_data['finance']['available']}"
         )
 
+        # insights：结构核对（有数据周才可能有条目，冒烟里只验调用与形状）
+        insights_data = (await client.call_tool("get_insights", {"ref_date": "2026-10-16"})).data
+        assert isinstance(insights_data["items"], list)
+        for item in insights_data["items"]:
+            assert {"area", "kind", "metric", "current", "previous", "change", "direction"} <= set(item)
+        print(f"get_insights → {len(insights_data['items'])} 条: "
+              f"{[i['metric'] for i in insights_data['items']]}")
+
     print("smoke passed ✅")
 
 

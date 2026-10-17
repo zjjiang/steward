@@ -6,7 +6,7 @@ credi-insights）在 app/finance/tools.py 注册。
 """
 
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from fastmcp import FastMCP
@@ -14,8 +14,12 @@ from fastmcp.exceptions import ToolError
 
 from app.finance import analyze
 from app.finance.backend import close_backend, get_backend
-from app.finance.tools import _month_transactions, _recent_months
-from app.modules import body, commute, diet, fitness, review
+from app.finance.tools import (
+    _month_transactions,
+    _recent_months,
+    fetch_transactions_range,
+)
+from app.modules import body, commute, diet, fitness, insights, review
 from app.store.db import connect, init_db
 from app.store.events import DEFAULT_LIST_LIMIT, insert_event, list_events
 from app.store.goals import (
@@ -78,6 +82,12 @@ INSTRUCTIONS = """Steward —— 个人生活管家。
   例："这周复盘一下" → get_review(period="week")；"十月复盘" → get_review(period="month", ref_date="2026-10-31")。
   你（龙虾）拿这些 sections 成文：先运动与目标达成，再财务重点（分类占比、订阅），
   其他 section 简述；finance.available=false 时跳过财务段即可，不要报错。
+
+【insights 洞察】
+- get_insights：跨周期趋势与异常（运动/饮食周环比、支出月环比、分类跳变、
+  体重斜率）。只含过显著性门槛的条目，宁缺毋滥。
+  例："最近有什么趋势" → get_insights()；用户问"我是不是练少了"也可先查它。
+  复盘成文时可把条目自然融入；无条目就是没有值得说的，不要硬凑。
 """
 
 
@@ -524,7 +534,7 @@ async def _finance_section(period: str, start: str, end: str) -> dict:
     """财务段：窗口汇总；月度附订阅识别。失败降级 available:false。"""
     try:
         be = get_backend()
-        transactions = await be.call("get_transactions", {"startDate": start, "endDate": end})
+        transactions = await fetch_transactions_range(be, start, end)
         section = {"available": True, **analyze.summarize_transactions(transactions)}
         if period == "month":
             subs_txs: list[dict] = []
@@ -534,6 +544,72 @@ async def _finance_section(period: str, start: str, end: str) -> dict:
         return section
     except ToolError as e:
         return {"available": False, "error": str(e)}
+
+
+# ---------- insights 模块（跨周期趋势与异常，app/modules/insights.py） ----------
+
+
+@mcp.tool
+async def get_insights(ref_date: str | None = None) -> dict:
+    """趋势与异常洞察：运动/饮食周环比、支出月环比与分类跳变、体重斜率。
+
+    只报满足显著性门槛的信号（宁缺毋滥）；上游财务不可用时跳过 finance 条目。
+
+    Args:
+        ref_date: 基准日（YYYY-MM-DD），缺省今天
+    """
+    ref = (ref_date or datetime.now(TZ).strftime("%Y-%m-%d")).strip()
+    try:
+        ref_d = datetime.strptime(ref, "%Y-%m-%d").date()
+    except ValueError:
+        raise ToolError(f"ref_date 格式应为 YYYY-MM-DD（例：2026-10-16），收到 {ref_date!r}")
+
+    def _window(period: str, anchor: date) -> tuple[str, str]:
+        start, end = fitness.current_period(period, today=anchor)
+        return start.isoformat(), end.isoformat()
+
+    week_this = _window("week", ref_d)
+    week_prev = _window("week", ref_d - timedelta(days=7))
+    month_this = _window("month", ref_d)
+    month_prev = _window("month", ref_d.replace(day=1) - timedelta(days=1))
+    window_start = (ref_d - timedelta(days=insights.WEIGHT_WINDOW_DAYS - 1)).isoformat()
+
+    conn = get_conn()
+    try:
+        all_workouts = _workouts(conn)
+        all_meals = list_events(conn, type="meal", limit=10000)["items"]
+        all_bodies = list_events(conn, type="body", limit=10000)["items"]
+    finally:
+        conn.close()
+
+    def _between(events: list[dict], start: str, end: str) -> list[dict]:
+        return [e for e in events if start <= e["occurred_at"][:10] <= end]
+
+    finance_this = finance_prev = cat_this = cat_prev = None
+    try:
+        be = get_backend()
+        txs_this = await fetch_transactions_range(be, *month_this)
+        txs_prev = await fetch_transactions_range(be, *month_prev)
+        s_this = analyze.summarize_transactions(txs_this)
+        s_prev = analyze.summarize_transactions(txs_prev)
+        finance_this, finance_prev = s_this["total_debit"], s_prev["total_debit"]
+        cat_this, cat_prev = s_this["by_category"], s_prev["by_category"]
+    except ToolError:
+        pass  # 上游不可用：finance 条目整体跳过
+
+    return {
+        "items": insights.assemble_insights(
+            workouts_this=_between(all_workouts, *week_this),
+            workouts_prev=_between(all_workouts, *week_prev),
+            meals_this=_between(all_meals, *week_this),
+            meals_prev=_between(all_meals, *week_prev),
+            debit_this=finance_this,
+            debit_prev=finance_prev,
+            cat_this=cat_this,
+            cat_prev=cat_prev,
+            bodies_window=_between(all_bodies, window_start, ref),
+        )
+    }
 
 
 # ---------- finance 模块（读上游 credi-insights，app/finance/tools.py） ----------

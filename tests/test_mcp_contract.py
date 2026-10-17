@@ -367,23 +367,24 @@ def finance_backend(monkeypatch):
 
 
 class TestFinanceSummary:
-    async def test_cross_card_merge(self, isolated_db, finance_backend):
+    async def test_month_summary_from_transactions(self, isolated_db, finance_backend):
+        # 上游 v1.1.0 起 get_stats 退役，汇总全部来自 get_transactions（单月）
         finance_backend.responses = {
-            "list_cards": [{"id": "c1", "bank": "CMB"}, {"id": "c2", "bank": "SPDB"}],
-            "get_stats": lambda a: _fin_stats(a["cardId"], 100 if a["cardId"] == "c1" else 80.5),
-            "get_transactions": [
-                _fin_tx("t1", "美团", "28.00", "2026-10-05T00:00:00.000Z"),
-                _fin_tx("t2", "滴滴出行", "23.50", "2026-10-06T00:00:00.000Z"),
-            ],
+            "get_transactions": lambda a: (
+                [_fin_tx("t1", "美团", "28.00", "2026-10-05T00:00:00.000Z", category_id="cat1")]
+                if a["month"] == "2026-10"
+                else [_fin_tx("t2", "滴滴出行", "23.50", "2026-09-20T00:00:00.000Z", category_id="cat2")]
+            ),
         }
         from fastmcp import Client
 
         async with Client(mcp) as client:
             data = await call(client, "spending_summary", {"month": "2026-10"})
         assert data["month"] == "2026-10"
-        assert data["total_debit"] == 180.5
-        assert data["transaction_count"] == 2
-        assert data["top_merchants"][0] == {"merchant": "美团", "amount": 28.0}
+        assert data["total_debit"] == 28.0
+        assert data["transaction_count"] == 1
+        assert data["by_category"] == [{"name": "餐饮", "amount": 28.0}]  # 降序列表
+        assert data["top_merchants"] == [{"merchant": "美团", "amount": 28.0}]
 
     async def test_bad_month_rejected(self, isolated_db, finance_backend):
         from fastmcp import Client
@@ -401,7 +402,7 @@ class TestFinanceSummary:
 
         # 真实链路中 backend 已把上游故障转译为本消息（见 test_finance_backend.py）
         finance_backend.responses = {
-            "list_cards": ToolError("财务数据源不可用：Error: connection refused"),
+            "get_transactions": ToolError("财务数据源不可用：Error: connection refused"),
         }
         async with Client(mcp) as client:
             with pytest.raises(ToolError, match="财务数据源不可用"):
@@ -411,11 +412,11 @@ class TestFinanceSummary:
 class TestFinanceTrend:
     async def test_two_months_with_change(self, isolated_db, finance_backend):
         months = _recent_months(2)
-        debit_map = {months[0]: 80.0, months[1]: 120.0}
         finance_backend.responses = {
-            "list_cards": [{"id": "c1"}],
-            "get_stats": lambda a: _fin_stats("c1", debit_map[a["period"]]),
-            "get_transactions": [],
+            "get_transactions": lambda a: [
+                _fin_tx("t1", "美团", "80.00" if a["month"] == months[0] else "120.00",
+                        f"{a['month']}-10T00:00:00.000Z"),
+            ],
         }
         from fastmcp import Client
 
@@ -440,11 +441,11 @@ class TestFinanceTrend:
 class TestFinanceSubscriptions:
     async def test_subscription_detected(self, isolated_db, finance_backend):
         months = _recent_months(3)
-        by_start = {
-            f"{m}-01": [_fin_tx(f"t{i}", "爱奇艺", "25.00", f"{m}-10T00:00:00.000Z")]
+        by_month = {
+            m: [_fin_tx(f"t{i}", "爱奇艺", "25.00", f"{m}-10T00:00:00.000Z")]
             for i, m in enumerate(months)
         }
-        finance_backend.responses = {"get_transactions": lambda a: by_start[a["startDate"]]}
+        finance_backend.responses = {"get_transactions": lambda a: by_month[a["month"]]}
         from fastmcp import Client
 
         async with Client(mcp) as client:
@@ -488,9 +489,8 @@ class TestFinanceClassification:
         assert data["date"] == "2026-10-16"
         assert data["count"] == 2
         assert [i["tx_id"] for i in data["items"]] == ["t2", "t3"]
-        assert finance_backend.calls[-1] == (
-            "get_transactions", {"startDate": "2026-10-16", "endDate": "2026-10-16"},
-        )
+        # 上游 v1.1.0 只按月过滤，单日窗口 = 拉整月 + 客户端按日期过滤
+        assert finance_backend.calls[-1] == ("get_transactions", {"month": "2026-10", "limit": 500})
 
     async def test_pending_bad_date_rejected(self, isolated_db, finance_backend):
         from fastmcp import Client
@@ -631,3 +631,54 @@ class TestReview:
         assert data["commute"]["days"] == 0
         assert data["other"] == {}
         assert data["finance"]["available"] is True
+
+
+class TestInsights:
+    def _fin_txs(self, amount, month="2026-10"):
+        return [_fin_tx("t1", "美团", f"{amount}.00", f"{month}-05T00:00:00.000Z", category_id="cat1")]
+
+    async def test_insights_success(self, isolated_db, finance_backend):
+        finance_backend.responses = {
+            "get_transactions": lambda a: self._fin_txs(
+                900 if a["month"] == "2026-10" else 400, month=a["month"]
+            ),
+        }
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            # 本周（10-12..）跑 8km，上周跑 20km → 距离显著下降
+            await call(client, "log_workout", {"sport": "run", "distance_km": 8, "occurred_at": "2026-10-13T08:00:00"})
+            await call(client, "log_workout", {"sport": "run", "distance_km": 20, "occurred_at": "2026-10-06T08:00:00"})
+            data = await call(client, "get_insights", {"ref_date": "2026-10-16"})
+        metrics = {(i["area"], i["metric"]) for i in data["items"]}
+        assert ("fitness", "total_distance_km") in metrics
+        assert ("finance", "total_debit") in metrics
+        assert ("finance", "category:餐饮") in metrics
+
+    async def test_insights_invalid_ref_date(self, isolated_db, finance_backend):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="ref_date"):
+                await call(client, "get_insights", {"ref_date": "下周"})
+
+    async def test_insights_finance_degraded(self, isolated_db, finance_backend):
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        finance_backend.responses = {"get_transactions": ToolError("财务数据源不可用：x")}
+        async with Client(mcp) as client:
+            await call(client, "log_workout", {"sport": "run", "distance_km": 8, "occurred_at": "2026-10-13T08:00:00"})
+            await call(client, "log_workout", {"sport": "run", "distance_km": 20, "occurred_at": "2026-10-06T08:00:00"})
+            data = await call(client, "get_insights", {"ref_date": "2026-10-16"})
+        assert data["items"]  # 本地信号照常
+        assert all(i["area"] != "finance" for i in data["items"])
+
+    async def test_insights_empty_silent(self, isolated_db, finance_backend):
+        finance_backend.responses = {"get_transactions": lambda a: []}
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            data = await call(client, "get_insights", {"ref_date": "2026-10-16"})
+        assert data == {"items": []}
