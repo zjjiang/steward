@@ -85,8 +85,14 @@ def detect_subscriptions(
 
 
 def filter_pending(transactions: list[dict]) -> list[dict]:
-    """未分类交易投影（tx_id/merchant/amount/cardLast4/txTime），按交易时间升序。"""
-    pending = [t for t in transactions if t.get("categoryId") is None]
+    """未分类交易投影（tx_id/merchant/amount/cardLast4/txTime），按交易时间升序。
+
+    上游 v1.1.0 不回 categoryId，未分类以 category 缺失/None 表达，两种形状都认。
+    """
+    pending = [
+        t for t in transactions
+        if t.get("categoryId") is None and t.get("category") is None
+    ]
     # 同日无 txTime（月账单来源）排在有时间的之后
     pending.sort(key=lambda t: (t.get("txDate") or "", t.get("txTime") is None, t.get("txTime") or ""))
     return [

@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Steward 仪表盘</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1f2328; --muted: #6b7280;
+    --line: #e5e7eb; --accent: #2563eb; --up: #dc2626; --down: #16a34a;
+    --chip: #eef2ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101418; --card: #1a2026; --text: #e6e8eb; --muted: #9aa3ad;
+      --line: #2a323a; --accent: #60a5fa; --up: #f87171; --down: #4ade80;
+      --chip: #1e2a3f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "PingFang SC", "Segoe UI", sans-serif;
+    padding-bottom: calc(64px + env(safe-area-inset-bottom));
+  }
+  header { padding: 16px 16px 0; }
+  header h1 { font-size: 18px; margin: 0 0 12px; }
+  nav { display: flex; gap: 8px; }
+  nav button {
+    flex: 1; padding: 8px 0; border: 1px solid var(--line); border-radius: 10px;
+    background: var(--card); color: var(--muted); font-size: 14px; cursor: pointer;
+  }
+  nav button.active { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+  main { padding: 12px 16px; max-width: 720px; margin: 0 auto; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 12px 14px; margin-top: 10px; flex: 1 1 160px;
+  }
+  .card h3 { margin: 0 0 6px; font-size: 13px; color: var(--muted); font-weight: 500; }
+  .big { font-size: 22px; font-weight: 700; }
+  .sub { color: var(--muted); font-size: 12px; }
+  ul { margin: 6px 0 0; padding-left: 18px; }
+  li { margin: 2px 0; }
+  .bar { height: 8px; border-radius: 4px; background: var(--chip); margin-top: 4px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--accent); }
+  .tag { display: inline-block; padding: 0 8px; border-radius: 999px; background: var(--chip); font-size: 12px; color: var(--accent); margin-right: 6px; }
+  .up { color: var(--up); } .down { color: var(--down); }
+  .muted { color: var(--muted); }
+  .controls { display: flex; gap: 8px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+  .controls input, .controls select {
+    padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--card); color: var(--text); font-size: 14px;
+  }
+  .empty { color: var(--muted); text-align: center; padding: 24px 0; }
+  .error { color: var(--up); text-align: center; padding: 24px 0; }
+  #loading { display: none; text-align: center; color: var(--muted); padding: 20px 0; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Steward 仪表盘 <span class="sub">只读观察窗 · 主入口仍是龙虾</span></h1>
+  <nav>
+    <button data-tab="today" class="active">今日</button>
+    <button data-tab="review">复盘</button>
+    <button data-tab="insights">洞察</button>
+    <button data-tab="finance">账单</button>
+  </nav>
+</header>
+<main>
+  <div id="loading">加载中…</div>
+
+  <section id="tab-today">
+    <div class="controls">
+      <label class="muted">日期</label>
+      <input type="date" id="today-date">
+    </div>
+    <div id="today-body"></div>
+  </section>
+
+  <section id="tab-review" class="hidden">
+    <div class="controls">
+      <select id="review-period">
+        <option value="week">本周</option>
+        <option value="month">本月</option>
+      </select>
+    </div>
+    <div id="review-body"></div>
+  </section>
+
+  <section id="tab-insights" class="hidden">
+    <div id="insights-body"></div>
+  </section>
+
+  <section id="tab-finance" class="hidden">
+    <div class="controls">
+      <label class="muted">月份</label>
+      <input type="month" id="finance-month">
+    </div>
+    <div id="finance-body"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (sel) => document.querySelector(sel);
+const fmtMoney = (n) => `¥${Number(n).toFixed(2)}`;
+const fmtNum = (n) => Number(n).toFixed(2).replace(/\.00$/, "");
+
+async function getJson(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    let detail = `HTTP ${resp.status}`;
+    try { detail = (await resp.json()).detail || detail; } catch (e) { /* keep */ }
+    throw new Error(detail);
+  }
+  return resp.json();
+}
+
+async function render(loader, bodyEl) {
+  $("#loading").style.display = "block";
+  bodyEl.innerHTML = "";
+  try {
+    await loader(bodyEl);
+  } catch (e) {
+    bodyEl.innerHTML = `<div class="error">加载失败：${e.message}</div>`;
+  } finally {
+    $("#loading").style.display = "none";
+  }
+}
+
+function card(title, big, sub) {
+  return `<div class="card"><h3>${title}</h3><div class="big">${big}</div>` +
+         (sub ? `<div class="sub">${sub}</div>` : "") + `</div>`;
+}
+
+function list(title, itemsHtml) {
+  return `<div class="card" style="flex-basis:100%"><h3>${title}</h3>${itemsHtml}</div>`;
+}
+
+// ---------- 今日 ----------
+async function loadToday(el) {
+  const day = $("#today-date").value;
+  const d = await getJson(`/api/day?date=${day}`);
+  const w = d.workouts.summary, m = d.meals.summary, b = d.body.summary, c = d.commute.summary;
+  const latest = b.series.length ? b.series[b.series.length - 1] : null;
+  let html = `<div class="row">`;
+  html += card("运动", `${w.count} 次`,
+    `${fmtNum(w.total_duration_min || 0)} 分钟 · ${fmtNum(w.total_distance_km || 0)} km`);
+  html += card("饮食", `${m.count} 顿`, `花费 ${fmtMoney(m.total_cost || 0)}`);
+  html += card("体重", latest ? `${fmtNum(latest.weight_kg)} kg` : "—",
+    b.change != null ? `较记录起点 ${b.change >= 0 ? "+" : ""}${fmtNum(b.change)} kg` : "样本不足");
+  html += card("通勤", `${c.days || 0} 天`, `到岗 ${c.in_count || 0} · 离岗 ${c.out_count || 0}`);
+  html += `</div>`;
+
+  const wItems = d.workouts.items.map((x) =>
+    `<li>${x.payload.sport}${x.payload.distance_km ? ` · ${fmtNum(x.payload.distance_km)}km` : ""}${x.payload.duration_min ? ` · ${x.payload.duration_min}min` : ""} <span class="sub">${(x.occurred_at || "").slice(11, 16)}</span></li>`).join("");
+  const mItems = d.meals.items.map((x) =>
+    `<li>${x.payload.desc}${x.payload.cost != null ? ` · ${fmtMoney(x.payload.cost)}` : ""} <span class="sub">${(x.occurred_at || "").slice(11, 16)}</span></li>`).join("");
+  if (wItems) html += list("运动明细", `<ul>${wItems}</ul>`);
+  if (mItems) html += list("饮食明细", `<ul>${mItems}</ul>`);
+  if (!wItems && !mItems) html += `<div class="empty">今天还没有记录 —— 去跟龙虾说一声</div>`;
+  el.innerHTML = html;
+}
+
+// ---------- 复盘 ----------
+const DIR_LABEL = { ahead: "超前", on_track: "正常", behind: "落后" };
+const GOAL_METRIC_LABEL = { distance: "跑量(km)", frequency: "次数", duration: "时长(分钟)" };
+async function loadReview(el) {
+  const period = $("#review-period").value;
+  const d = await getJson(`/api/review?period=${period}`);
+  const meta = d.meta;
+  let html = `<div class="card" style="flex-basis:100%"><h3>周期</h3>${meta.start} ~ ${meta.end}</div>`;
+
+  const f = d.fitness.summary;
+  html += `<div class="row">` +
+    card("运动", `${f.count} 次`, `${fmtNum(f.total_duration_min || 0)} 分钟 · ${fmtNum(f.total_distance_km || 0)} km`) +
+    card("饮食", `${d.diet.count} 顿`, `花费 ${fmtMoney(d.diet.total_cost || 0)}`) + `</div>`;
+
+  const goals = (d.fitness.goals || []).map((g) => {
+    const pct = g.target ? Math.min(100, Math.round((g.current / g.target) * 100)) : 0;
+    return `<li>${GOAL_METRIC_LABEL[g.metric] || g.metric}：${fmtNum(g.current)}/${fmtNum(g.target)}
+      <span class="bar"><i style="width:${pct}%"></i></span>
+      <span class="sub">${DIR_LABEL[g.verdict] || g.verdict} · 剩余 ${fmtNum(g.remaining)}</span></li>`;
+  }).join("");
+  if (goals) html += list("目标进度", `<ul>${goals}</ul>`);
+
+  if (d.finance && d.finance.available) {
+    const cats = (d.finance.by_category || []).slice(0, 5).map((c) => {
+      const pct = d.finance.total_debit ? Math.round((c.amount / d.finance.total_debit) * 100) : 0;
+      return `<li>${c.name} · ${fmtMoney(c.amount)} <span class="bar"><i style="width:${pct}%"></i></span></li>`;
+    }).join("");
+    html += list("财务", `<ul><li>总支出 <b>${fmtMoney(d.finance.total_debit)}</b> · ${d.finance.transaction_count} 笔</li>${cats}</ul>`);
+  } else if (d.finance) {
+    html += `<div class="card" style="flex-basis:100%"><h3>财务</h3><span class="muted">${d.finance.error}</span></div>`;
+  }
+
+  const others = Object.entries(d.other || {});
+  if (others.length) {
+    html += list("其他事件", `<ul>${others.map(([t, n]) => `<li><span class="tag">${t}</span>${n} 条</li>`).join("")}</ul>`);
+  }
+  el.innerHTML = html;
+}
+
+// ---------- 洞察 ----------
+const AREA_LABEL = { fitness: "运动", diet: "饮食", finance: "财务", body: "身体" };
+const METRIC_LABEL = {
+  workout_count: "运动次数", total_distance_km: "跑动距离", total_duration_min: "运动时长",
+  meal_count: "吃饭顿数", meal_total_cost: "饮食花费", total_debit: "月支出",
+  weight_rate_kg_week: "体重变化",
+};
+function metricName(m) {
+  if (m.startsWith("category:")) return `「${m.slice(9)}」支出`;
+  return METRIC_LABEL[m] || m;
+}
+async function loadInsights(el) {
+  const d = await getJson(`/api/insights`);
+  const items = d.items || [];
+  if (!items.length) {
+    el.innerHTML = `<div class="empty">近期没有值得说的变化（宁缺毋滥）</div>`;
+    return;
+  }
+  el.innerHTML = items.map((it) => {
+    const arrow = it.direction === "up" ? `<span class="up">↑</span>` : `<span class="down">↓</span>`;
+    return `<div class="card" style="flex-basis:100%">
+      <h3>${AREA_LABEL[it.area] || it.area} · ${it.kind === "anomaly" ? "异常" : "趋势"}</h3>
+      ${metricName(it.metric)}：${fmtNum(it.previous)} → <b>${fmtNum(it.current)}</b> ${arrow}
+      <span class="sub">变化 ${fmtNum(it.change)}</span></div>`;
+  }).join("");
+}
+
+// ---------- 账单 ----------
+async function loadFinance(el) {
+  const month = $("#finance-month").value;
+  const d = await getJson(`/api/finance?month=${month}`);
+  if (!d.available) {
+    el.innerHTML = `<div class="error">财务数据不可用：${d.error}</div>`;
+    return;
+  }
+  const s = d.summary;
+  let html = `<div class="row">` +
+    card("总支出", fmtMoney(s.total_debit), `${s.transaction_count} 笔`) +
+    card("总收入", fmtMoney(s.total_credit)) + `</div>`;
+
+  const cats = (s.by_category || []).slice(0, 8).map((c) => {
+    const pct = s.total_debit ? Math.round((c.amount / s.total_debit) * 100) : 0;
+    return `<li>${c.name} · ${fmtMoney(c.amount)}
+      <span class="bar"><i style="width:${pct}%"></i></span></li>`;
+  }).join("");
+  if (cats) html += list("分类占比", `<ul>${cats}</ul>`);
+
+  const trend = (d.trend || []).map((t) => {
+    const chg = t.change_vs_prev == null ? "" :
+      `<span class="${t.change_vs_prev > 0 ? "up" : "down"}">${t.change_vs_prev > 0 ? "+" : ""}${fmtNum(t.change_vs_prev)}</span>`;
+    return `<li>${t.month} · ${fmtMoney(t.total_debit)} ${chg}</li>`;
+  }).join("");
+  if (trend) html += list("近 6 个月", `<ul>${trend}</ul>`);
+
+  const subs = (d.subscriptions || []).map((x) =>
+    `<li>${x.merchant} · 月均 ${fmtMoney(x.monthly_avg)}（${x.months_count} 个月）</li>`).join("");
+  html += list("订阅 / 固定支出", subs ? `<ul>${subs}</ul>` : `<span class="muted">没有识别到</span>`);
+
+  const p = d.pending || { count: 0, items: [] };
+  const pItems = p.items.map((x) =>
+    `<li>${x.merchant || "(无商户)"} · ${fmtMoney(x.amount)} <span class="sub">${x.txTime || x.tx_id}</span></li>`).join("");
+  html += list(`待确认分类（${p.count}）`,
+    p.count ? `<ul>${pItems}</ul><div class="sub">去跟龙虾说一声逐笔确认</div>`
+            : `<span class="muted">都分类好了</span>`);
+  el.innerHTML = html;
+}
+
+// ---------- tab 切换 ----------
+const LOADERS = {
+  today: () => render(loadToday, $("#today-body")),
+  review: () => render(loadReview, $("#review-body")),
+  insights: () => render(loadInsights, $("#insights-body")),
+  finance: () => render(loadFinance, $("#finance-body")),
+};
+function switchTab(name) {
+  document.querySelectorAll("nav button").forEach((b) =>
+    b.classList.toggle("active", b.dataset.tab === name));
+  document.querySelectorAll("main section").forEach((s) =>
+    s.classList.toggle("hidden", s.id !== `tab-${name}`));
+  LOADERS[name]();
+}
+document.querySelectorAll("nav button").forEach((b) =>
+  b.addEventListener("click", () => switchTab(b.dataset.tab)));
+$("#today-date").addEventListener("change", () => LOADERS.today());
+$("#review-period").addEventListener("change", () => LOADERS.review());
+$("#finance-month").addEventListener("change", () => LOADERS.finance());
+
+function todayIso() { return new Date().toLocaleDateString("sv-SE"); }
+function monthIso() { return todayIso().slice(0, 7); }
+$("#today-date").value = todayIso();
+$("#finance-month").value = monthIso();
+switchTab("today");
+</script>
+</body>
+</html>
