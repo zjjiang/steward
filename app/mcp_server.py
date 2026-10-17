@@ -1,15 +1,18 @@
 """Steward MCP server（stdio）——龙虾背后的生活管家。
 
 通用生活流水工具（兜底通道，零领域校验）+ 各生活模块的专用工具。
-当前模块：fitness（运动 + 目标）。新模块在 app/modules/ 下实现并在本文件注册。
+本地模块在 app/modules/ 下实现并在本文件注册；finance 模块（读上游
+credi-insights）在 app/finance/tools.py 注册。
 """
 
+from contextlib import asynccontextmanager
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
+from app.finance.backend import close_backend
 from app.modules import body, commute, diet, fitness
 from app.store.db import connect, init_db
 from app.store.events import DEFAULT_LIST_LIMIT, insert_event, list_events
@@ -48,7 +51,28 @@ INSTRUCTIONS = """Steward —— 个人生活管家。
 - log_event：记录任意类型生活事件。type 为事件类型；payload 必须是 JSON object；
   raw_text 传用户原话，会永久保留。
 - query_events：按 type 与日期窗口查询事件明细（倒序），不做汇总统计。
+
+【finance 模块】数据来自 credi-insights（信用卡账单），本地不落库。
+- spending_summary：跨卡月度汇总（总支出/收入/分类占比/Top 商户）。
+  例："这个月花了多少" → spending_summary()。
+- spending_trend：近 N 个月逐月支出 + 环比。例："比上月多花了吗" → spending_trend(months=2)。
+- subscriptions：订阅/固定支出识别。例："我有哪些订阅" → subscriptions()。
+- 每日账单分类流水线（收到推送后）：
+  sync_card(card_id) → auto_classify()（dry_run 缺省 true，先预览）→
+  确认无误后 auto_classify(dry_run=false) 执行 →
+  pending_classifications() 列出规则没吃掉的未分类交易 → 逐笔问用户 →
+  确认后 classify_transaction(tx_id, category_id)；
+  用户说"以后都这样" → create_rule 固化。
+- list_cards / list_categories / list_rules：卡片 / 分类 / 规则清单。
 """
+
+
+@asynccontextmanager
+async def _lifespan(server: FastMCP):
+    try:
+        yield
+    finally:
+        await close_backend()
 
 
 def _normalize_occurred_at(value: str | None) -> str:
@@ -77,7 +101,7 @@ def get_conn():
     return conn
 
 
-mcp = FastMCP("steward", instructions=INSTRUCTIONS)
+mcp = FastMCP("steward", instructions=INSTRUCTIONS, lifespan=_lifespan)
 
 
 @mcp.tool
@@ -381,6 +405,7 @@ def query_body(
 # ---------- commute 模块 ----------
 
 
+
 @mcp.tool
 def check_in(
     direction: str,
@@ -430,6 +455,13 @@ def query_commute(
         conn.close()
     result["summary"] = commute.summarize(result["items"])
     return result
+
+
+# ---------- finance 模块（读上游 credi-insights，app/finance/tools.py） ----------
+
+from app.finance.tools import register_finance_tools
+
+register_finance_tools(mcp)
 
 
 if __name__ == "__main__":
