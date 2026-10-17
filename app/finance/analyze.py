@@ -142,3 +142,36 @@ def filter_pending(transactions: list[dict]) -> list[dict]:
         }
         for t in pending
     ]
+
+
+def summarize_transactions(transactions: list[dict]) -> dict:
+    """任意时间窗口的交易汇总（get_transactions 响应 → totals/分类/Top 商户）。
+
+    与 merge_card_stats 的区别：不依赖上游按月的 get_stats，周/月同一代码路径。
+    分类按 category.name 归组，无分类计"未分类"。
+    """
+    total_debit = 0.0
+    total_credit = 0.0
+    by_category: dict[str, float] = {}
+    merchants: dict[str, float] = {}
+    for t in transactions:
+        amount = _num(t.get("amount", 0))
+        if t.get("type") == "DEBIT":
+            total_debit = _num(total_debit + amount)
+            category = (t.get("category") or {}).get("name") or "未分类"
+            by_category[category] = _num(by_category.get(category, 0.0) + amount)
+            merchant = t.get("merchant", "")
+            merchants[merchant] = _num(merchants.get(merchant, 0.0) + amount)
+        else:
+            total_credit = _num(total_credit + amount)
+    top_merchants = [
+        {"merchant": name, "amount": amount}
+        for name, amount in sorted(merchants.items(), key=lambda kv: kv[1], reverse=True)
+    ][:TOP_MERCHANTS_LIMIT]
+    return {
+        "total_debit": total_debit,
+        "total_credit": total_credit,
+        "transaction_count": len(transactions),
+        "by_category": by_category,
+        "top_merchants": top_merchants,
+    }

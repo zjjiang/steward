@@ -223,3 +223,34 @@ class TestFilterPending:
     def test_all_classified_returns_empty(self):
         txs = [tx("t1", "已分类", "28.00", category_id="cat1")]
         assert analyze.filter_pending(txs) == []
+
+
+# ---------- summarize_transactions：任意窗口交易汇总 ----------
+
+
+class TestSummarizeTransactions:
+    def test_totals_and_categories(self):
+        txs = [
+            tx("t1", "美团", "28.00", category_id="cat1"),
+            tx("t2", "滴滴出行", "23.50", category_id="cat2"),
+            tx("t3", "美团", "12.00", category_id="cat1"),
+            tx("t4", "某小店", "9.90"),
+            tx("t5", "工资", "6000.00", type="CREDIT", category_id="cat3"),
+        ]
+        out = analyze.summarize_transactions(txs)
+        assert out["total_debit"] == 73.4
+        assert out["total_credit"] == 6000.0
+        assert out["transaction_count"] == 5
+        # 夹具 tx() 的分类名固定为"餐饮"（cat1/cat2 同名合并）、无分类计"未分类"
+        assert out["by_category"] == {"餐饮": 63.5, "未分类": 9.9}
+        assert out["top_merchants"][0] == {"merchant": "美团", "amount": 40.0}
+
+    def test_empty(self):
+        out = analyze.summarize_transactions([])
+        assert out == {
+            "total_debit": 0,
+            "total_credit": 0,
+            "transaction_count": 0,
+            "by_category": {},
+            "top_merchants": [],
+        }

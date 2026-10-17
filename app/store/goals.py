@@ -64,3 +64,9 @@ def active_goal_for(
         (kind, metric, period),
     ).fetchone()
     return _row_to_goal(row) if row else None
+
+
+def list_active_goals(conn: sqlite3.Connection) -> list[dict]:
+    """全部 status=active 的目标（复盘遍历用）。"""
+    rows = conn.execute("SELECT * FROM goals WHERE status='active' ORDER BY id").fetchall()
+    return [_row_to_goal(r) for r in rows]

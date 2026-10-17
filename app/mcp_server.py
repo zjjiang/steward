@@ -12,11 +12,19 @@ from zoneinfo import ZoneInfo
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
-from app.finance.backend import close_backend
-from app.modules import body, commute, diet, fitness
+from app.finance import analyze
+from app.finance.backend import close_backend, get_backend
+from app.finance.tools import _month_transactions, _recent_months
+from app.modules import body, commute, diet, fitness, review
 from app.store.db import connect, init_db
 from app.store.events import DEFAULT_LIST_LIMIT, insert_event, list_events
-from app.store.goals import VALID_METRICS, VALID_PERIODS, create_goal_superseding, get_goal
+from app.store.goals import (
+    VALID_METRICS,
+    VALID_PERIODS,
+    create_goal_superseding,
+    get_goal,
+    list_active_goals,
+)
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -64,6 +72,12 @@ INSTRUCTIONS = """Steward —— 个人生活管家。
   确认后 classify_transaction(tx_id, category_id)；
   用户说"以后都这样" → create_rule 固化。
 - list_cards / list_categories / list_rules：卡片 / 分类 / 规则清单。
+
+【review 复盘】
+- get_review：周期复盘数据（meta/fitness 含目标判定/diet/body/commute/finance/other）。
+  例："这周复盘一下" → get_review(period="week")；"十月复盘" → get_review(period="month", ref_date="2026-10-31")。
+  你（龙虾）拿这些 sections 成文：先运动与目标达成，再财务重点（分类占比、订阅），
+  其他 section 简述；finance.available=false 时跳过财务段即可，不要报错。
 """
 
 
@@ -455,6 +469,71 @@ def query_commute(
         conn.close()
     result["summary"] = commute.summarize(result["items"])
     return result
+
+
+# ---------- review 模块（跨模块编排：本地流水 + 目标 + 财务） ----------
+
+
+@mcp.tool
+async def get_review(period: str, ref_date: str | None = None) -> dict:
+    """周期复盘：本地生活流水 + 运动目标进度 + 财务汇总的结构化拼装（成文交给龙虾）。
+
+    Args:
+        period: week（周一起始周）/ month（自然月）
+        ref_date: 复盘基准日（YYYY-MM-DD），缺省今天
+    """
+    if period not in ("week", "month"):
+        raise ToolError(f"period 只支持 week/month，收到 {period!r}")
+    ref = (ref_date or datetime.now(TZ).strftime("%Y-%m-%d")).strip()
+    try:
+        ref = datetime.strptime(ref, "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        raise ToolError(f"ref_date 格式应为 YYYY-MM-DD（例：2026-10-16），收到 {ref_date!r}")
+
+    bounds = review.period_bounds(period, ref)
+    start, end = bounds["start"], bounds["end"]
+
+    conn = get_conn()
+    try:
+        workouts = _workouts(conn)  # 全量：目标进度按各自周期算
+        meals = list_events(conn, type="meal", date_from=start, date_to=end, limit=10000)["items"]
+        bodies = list_events(conn, type="body", date_from=start, date_to=end, limit=10000)["items"]
+        commutes = list_events(conn, type="commute", date_from=start, date_to=end, limit=10000)["items"]
+        others = list_events(conn, date_from=start, date_to=end, limit=10000)["items"]
+        goals = list_active_goals(conn)
+    finally:
+        conn.close()
+    other_events = [e for e in others if e["type"] not in review.KNOWN_TYPES]
+
+    finance_section = await _finance_section(period, start, end)
+
+    return review.assemble_review(
+        period=period,
+        ref_date=ref,
+        workouts=workouts,
+        meals=meals,
+        bodies=bodies,
+        commutes=commutes,
+        other_events=other_events,
+        goals=goals,
+        finance=finance_section,
+    )
+
+
+async def _finance_section(period: str, start: str, end: str) -> dict:
+    """财务段：窗口汇总；月度附订阅识别。失败降级 available:false。"""
+    try:
+        be = get_backend()
+        transactions = await be.call("get_transactions", {"startDate": start, "endDate": end})
+        section = {"available": True, **analyze.summarize_transactions(transactions)}
+        if period == "month":
+            subs_txs: list[dict] = []
+            for m in _recent_months(6):
+                subs_txs.extend(await _month_transactions(be, m))
+            section["subscriptions"] = analyze.detect_subscriptions(subs_txs)
+        return section
+    except ToolError as e:
+        return {"available": False, "error": str(e)}
 
 
 # ---------- finance 模块（读上游 credi-insights，app/finance/tools.py） ----------

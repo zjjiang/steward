@@ -78,6 +78,20 @@ async def main() -> None:
         assert commute_summary["days"] == 1 and commute_summary["in_count"] == 1
         print(f"query_commute → {commute_summary}")
 
+        # review：月度复盘结构核对（财务段来自上游，冒烟只验结构不验数值）
+        review_data = (
+            await client.call_tool("get_review", {"period": "month", "ref_date": "2026-10-16"})
+        ).data
+        assert review_data["meta"]["start"] == "2026-10-01"
+        assert review_data["fitness"]["summary"]["count"] >= 3
+        assert "diet" in review_data and "finance" in review_data and "other" in review_data
+        print(
+            f"get_review → {review_data['meta']['period']} "
+            f"{review_data['meta']['start']}..{review_data['meta']['end']}, "
+            f"fitness={review_data['fitness']['summary']['count']} 次, "
+            f"finance.available={review_data['finance']['available']}"
+        )
+
     print("smoke passed ✅")
 
 
