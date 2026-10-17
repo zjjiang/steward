@@ -46,63 +46,6 @@ def stats(card_id, debit, credit, count, breakdown):
     }
 
 
-# ---------- merge_card_stats：跨卡月度汇总 ----------
-
-
-class TestMergeCardStats:
-    def test_merge_two_cards(self):
-        card_stats = [
-            stats("c1", 100.0, 20.0, 5, [
-                {"categoryId": "cat1", "name": "餐饮", "icon": "🍜", "amount": 60.0, "count": 2},
-                {"categoryId": "uncategorized", "name": "未分类", "icon": None, "amount": 40.0, "count": 3},
-            ]),
-            stats("c2", 80.5, 0, 3, [
-                {"categoryId": "cat1", "name": "餐饮", "icon": "🍜", "amount": 30.5, "count": 1},
-                {"categoryId": "cat2", "name": "交通", "icon": "🚇", "amount": 50.0, "count": 2},
-            ]),
-        ]
-        transactions = [
-            tx("t1", "美团", "28.00", category_id="cat1"),
-            tx("t2", "美团", "35.00", category_id="cat1"),
-            tx("t3", "滴滴出行", "23.50", category_id="cat2"),
-            tx("t4", "工资", "6000.00", type="CREDIT", category_id="cat3"),
-        ]
-        out = analyze.merge_card_stats(card_stats, transactions)
-        assert out["total_debit"] == 180.5
-        assert out["total_credit"] == 20.0
-        assert out["transaction_count"] == 8
-        # 分类跨卡合并、按金额降序
-        assert out["by_category"][0] == {
-            "category_id": "cat1", "name": "餐饮", "icon": "🍜", "amount": 90.5, "count": 3,
-        }
-        assert out["by_category"][1]["category_id"] == "cat2"
-        assert out["by_category"][2]["category_id"] == "uncategorized"
-        # Top 商户只统计支出、金额降序
-        assert out["top_merchants"] == [
-            {"merchant": "美团", "amount": 63.0},
-            {"merchant": "滴滴出行", "amount": 23.5},
-        ]
-
-    def test_empty(self):
-        out = analyze.merge_card_stats([], [])
-        assert out["total_debit"] == 0
-        assert out["total_credit"] == 0
-        assert out["transaction_count"] == 0
-        assert out["by_category"] == []
-        assert out["top_merchants"] == []
-
-    def test_top_merchants_max_five(self):
-        transactions = [tx(f"t{i}", f"商户{i}", "10.00") for i in range(8)]
-        out = analyze.merge_card_stats([], transactions)
-        assert len(out["top_merchants"]) == 5
-        assert out["top_merchants"][0]["merchant"] == "商户0"
-
-    def test_amount_string_coerced(self):
-        # 上游 get_transactions 的 amount 是字符串，必须归一为两位小数数字
-        out = analyze.merge_card_stats([], [tx("t1", "美团", "28.00")])
-        assert out["top_merchants"][0]["amount"] == 28.0
-
-
 # ---------- compute_trend：趋势与环比 ----------
 
 
@@ -254,3 +197,56 @@ class TestSummarizeTransactions:
             "by_category": {},
             "top_merchants": [],
         }
+
+
+# ---------- normalize_transactions：上游 v1.1.0 适配 ----------
+
+
+class TestNormalizeTransactions:
+    def test_new_shape_mapped(self):
+        # 新上游：date(YYYY-MM-DD)/amount 数字/category 名字符串，无 txTime/cardLast4
+        raw = [{"id": "t1", "date": "2026-10-05", "merchant": "美团", "amount": 28,
+                "type": "DEBIT", "category": "餐饮"}]
+        out = analyze.normalize_transactions(raw)
+        assert out[0]["txDate"] == "2026-10-05"
+        assert out[0]["amount"] == 28
+        assert out[0]["category"] == {"name": "餐饮"}
+        assert out[0]["categoryId"] is None
+        assert out[0]["txTime"] is None
+        assert out[0]["cardLast4"] is None
+
+    def test_uncategorized_becomes_none(self):
+        out = analyze.normalize_transactions([{"id": "t1", "date": "2026-10-05",
+                                               "merchant": "x", "amount": 1,
+                                               "type": "DEBIT", "category": "未分类"}])
+        assert out[0]["category"] is None  # filter_pending 的未分类判据
+
+    def test_old_shape_passthrough(self):
+        # 兼容旧形状（测试夹具/潜在回滚）
+        raw = [{"id": "t1", "txDate": "2026-10-05T00:00:00.000Z", "merchant": "美团",
+                "amount": "28.00", "type": "DEBIT", "categoryId": "cat1",
+                "category": {"name": "餐饮"}}]
+        out = analyze.normalize_transactions(raw)
+        assert out[0]["txDate"] == "2026-10-05T00:00:00.000Z"
+        assert out[0]["category"] == {"name": "餐饮"}
+
+    def test_normalized_flows_through_pure_functions(self):
+        # 归一化后的新形状能直接进订阅识别/待确认/汇总
+        txs = analyze.normalize_transactions([
+            {"id": f"t{i}", "date": f"2026-{m:02d}-10", "merchant": "爱奇艺",
+             "amount": 25, "type": "DEBIT", "category": "娱乐"}
+            for i, m in enumerate([7, 8, 9, 10])
+        ])
+        subs = analyze.detect_subscriptions(txs)
+        assert len(subs) == 1 and subs[0]["monthly_avg"] == 25.0
+
+
+# ---------- months_covering：窗口覆盖月份 ----------
+
+
+class TestMonthsCovering:
+    def test_single_month(self):
+        assert analyze.months_covering("2026-10-05", "2026-10-31") == ["2026-10"]
+
+    def test_cross_month(self):
+        assert analyze.months_covering("2026-09-28", "2026-10-04") == ["2026-09", "2026-10"]

@@ -5,10 +5,11 @@
 所有金额入口统一经 _num 归一。
 """
 
+from datetime import date
+
 MIN_SUBSCRIPTION_MONTHS = 3
 SUBSCRIPTION_TOLERANCE = 0.20
 TOP_MERCHANTS_LIMIT = 5
-UNCATEGORIZED_ID = "uncategorized"
 
 
 def _num(value) -> float:
@@ -22,50 +23,6 @@ def _month_of(tx_date: str) -> str:
 
 def _date_of(tx_date: str) -> str:
     return tx_date[:10]
-
-
-def merge_card_stats(card_stats: list[dict], transactions: list[dict]) -> dict:
-    """跨卡合并 get_stats 结果；Top 商户取自全月 get_transactions（仅支出）。"""
-    total_debit = _num(sum(s.get("totalDebit", 0) for s in card_stats))
-    total_credit = _num(sum(s.get("totalCredit", 0) for s in card_stats))
-    transaction_count = sum(s.get("transactionCount", 0) for s in card_stats)
-
-    by_category: dict[str, dict] = {}
-    for s in card_stats:
-        for entry in s.get("categoryBreakdown", []):
-            cid = entry.get("categoryId") or UNCATEGORIZED_ID
-            bucket = by_category.setdefault(
-                cid,
-                {
-                    "category_id": cid,
-                    "name": entry.get("name", "未分类"),
-                    "icon": entry.get("icon"),
-                    "amount": 0.0,
-                    "count": 0,
-                },
-            )
-            bucket["amount"] = _num(bucket["amount"] + entry.get("amount", 0))
-            bucket["count"] += entry.get("count", 0)
-    categories = sorted(by_category.values(), key=lambda c: c["amount"], reverse=True)
-
-    merchants: dict[str, float] = {}
-    for t in transactions:
-        if t.get("type") != "DEBIT":
-            continue
-        name = t.get("merchant", "")
-        merchants[name] = _num(merchants.get(name, 0.0) + _num(t.get("amount", 0)))
-    top_merchants = [
-        {"merchant": name, "amount": amount}
-        for name, amount in sorted(merchants.items(), key=lambda kv: kv[1], reverse=True)
-    ][:TOP_MERCHANTS_LIMIT]
-
-    return {
-        "total_debit": total_debit,
-        "total_credit": total_credit,
-        "transaction_count": transaction_count,
-        "by_category": categories,
-        "top_merchants": top_merchants,
-    }
 
 
 def compute_trend(monthly: list[dict]) -> list[dict]:
@@ -175,3 +132,43 @@ def summarize_transactions(transactions: list[dict]) -> dict:
         "by_category": by_category,
         "top_merchants": top_merchants,
     }
+
+
+def normalize_transactions(transactions: list[dict] | None) -> list[dict]:
+    """上游交易 → 内部统一形状（txDate/category{name}/categoryId/cardLast4/txTime）。
+
+    credi-insights v1.1.0 起 get_transactions 返回 date（YYYY-MM-DD）、amount 数字、
+    category 名字符串；本函数同时兼容旧形状（txDate/category 对象），下游纯函数
+    只认统一形状。
+    """
+    normalized: list[dict] = []
+    for t in transactions or []:
+        category = t.get("category")
+        if isinstance(category, str):
+            category = None if category == "未分类" else {"name": category}
+        normalized.append(
+            {
+                "id": t.get("id"),
+                "txDate": t.get("txDate") or t.get("date") or "",
+                "txTime": t.get("txTime"),
+                "merchant": t.get("merchant", ""),
+                "amount": t.get("amount", 0),
+                "type": t.get("type", "DEBIT"),
+                "cardLast4": t.get("cardLast4"),
+                "categoryId": t.get("categoryId"),
+                "category": category,
+            }
+        )
+    return normalized
+
+
+def months_covering(start: str, end: str) -> list[str]:
+    """[start, end] 日期窗口覆盖的 YYYY-MM 列表（升序，通常 1-2 个）。"""
+    first = date.fromisoformat(start[:10])
+    last = date.fromisoformat(end[:10])
+    months = []
+    y, m = first.year, first.month
+    while (y, m) <= (last.year, last.month):
+        months.append(f"{y:04d}-{m:02d}")
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return months

@@ -4,7 +4,6 @@
 所有上游故障已由 backend 转译为"财务数据源不可用：…"的 ToolError。
 """
 
-import asyncio
 import calendar
 import re
 from datetime import datetime
@@ -70,19 +69,23 @@ def _recent_months(n: int) -> list[str]:
     return sorted(out)
 
 
-async def _card_stats(be, month: str) -> list[dict]:
-    cards = await be.call("list_cards")
-    if not cards:
-        return []
-    stats = await asyncio.gather(
-        *[be.call("get_stats", {"cardId": c["id"], "period": month}) for c in cards]
-    )
-    return list(stats)
+async def fetch_transactions_range(be, start: str, end: str) -> list[dict]:
+    """[start, end] 日期窗口内的交易（内部统一形状）。
+
+    上游 v1.1.0 的 get_transactions 只按月过滤（month 参数，limit 默认 50），
+    这里按窗口展开涉及月份逐月拉取（limit=500，量级见 mod-finance design），
+    归一化后按日期过滤。
+    """
+    transactions: list[dict] = []
+    for month in analyze.months_covering(start, end):
+        raw = await be.call("get_transactions", {"month": month, "limit": 500})
+        transactions.extend(analyze.normalize_transactions(raw))
+    return [t for t in transactions if start <= t["txDate"][:10] <= end]
 
 
 async def _month_transactions(be, month: str) -> list[dict]:
     start, end = _month_range(month)
-    return await be.call("get_transactions", {"startDate": start, "endDate": end})
+    return await fetch_transactions_range(be, start, end)
 
 
 def register_finance_tools(mcp) -> None:
@@ -96,9 +99,15 @@ def register_finance_tools(mcp) -> None:
         """
         month = _validate_month(month)
         be = get_backend()
-        stats = await _card_stats(be, month)
-        transactions = await _month_transactions(be, month)
-        summary = analyze.merge_card_stats(stats, transactions)
+        start, end = _month_range(month)
+        summary = analyze.summarize_transactions(await fetch_transactions_range(be, start, end))
+        # 面向龙虾的展示形状：分类按金额降序列表
+        summary["by_category"] = [
+            {"name": name, "amount": amount}
+            for name, amount in sorted(
+                summary["by_category"].items(), key=lambda kv: kv[1], reverse=True
+            )
+        ]
         return {"month": month, **summary}
 
     @mcp.tool
@@ -112,14 +121,15 @@ def register_finance_tools(mcp) -> None:
         be = get_backend()
         monthly = []
         for m in _recent_months(months):
-            stats = await _card_stats(be, m)
-            transactions = await _month_transactions(be, m)
-            merged = analyze.merge_card_stats(stats, transactions)
+            start, end = _month_range(m)
+            summary = analyze.summarize_transactions(
+                await fetch_transactions_range(be, start, end)
+            )
             monthly.append(
                 {
                     "month": m,
-                    "total_debit": merged["total_debit"],
-                    "by_category": {c["name"]: c["amount"] for c in merged["by_category"]},
+                    "total_debit": summary["total_debit"],
+                    "by_category": summary["by_category"],
                 }
             )
         return {"months": months, "items": analyze.compute_trend(monthly)}
@@ -211,8 +221,6 @@ def register_finance_tools(mcp) -> None:
             date: 日期（YYYY-MM-DD），缺省今天
         """
         day = _validate_day(date)
-        transactions = await get_backend().call(
-            "get_transactions", {"startDate": day, "endDate": day}
-        )
+        transactions = await fetch_transactions_range(get_backend(), day, day)
         items = analyze.filter_pending(transactions)
         return {"date": day, "count": len(items), "items": items}
