@@ -167,6 +167,17 @@ class TestFilterPending:
         txs = [tx("t1", "已分类", "28.00", category_id="cat1")]
         assert analyze.filter_pending(txs) == []
 
+    def test_v110_categorized_not_pending(self):
+        # 上游 v1.1.0 不回 categoryId：分类与否看 category 名（"未分类"已被归一化为 None）
+        txs = [
+            {"id": "t1", "txDate": "2026-10-05", "merchant": "美团", "amount": 35.5,
+             "type": "DEBIT", "categoryId": None, "category": {"name": "餐饮"}},
+            {"id": "t2", "txDate": "2026-10-06", "merchant": "地铁", "amount": 4.0,
+             "type": "DEBIT", "categoryId": None, "category": None},
+        ]
+        out = analyze.filter_pending(txs)
+        assert [i["tx_id"] for i in out] == ["t2"]
+
 
 # ---------- summarize_transactions：任意窗口交易汇总 ----------
 
