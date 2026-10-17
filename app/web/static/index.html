@@ -187,7 +187,13 @@ async function loadReview(el) {
   if (goals) html += list("目标进度", `<ul>${goals}</ul>`);
 
   if (d.finance && d.finance.available) {
-    const cats = (d.finance.by_category || []).slice(0, 5).map((c) => {
+    // review 的 by_category 是对象（get_review 原样透传），账单端点才是数组——两种都接
+    const rawCats = d.finance.by_category || [];
+    const catArr = Array.isArray(rawCats)
+      ? rawCats
+      : Object.entries(rawCats).map(([name, amount]) => ({ name, amount }))
+          .sort((a, b) => b.amount - a.amount);
+    const cats = catArr.slice(0, 5).map((c) => {
       const pct = d.finance.total_debit ? Math.round((c.amount / d.finance.total_debit) * 100) : 0;
       return `<li>${c.name} · ${fmtMoney(c.amount)} <span class="bar"><i style="width:${pct}%"></i></span></li>`;
     }).join("");
