@@ -127,6 +127,9 @@ def summarize_transactions(transactions: list[dict]) -> dict:
             merchants[merchant] = _num(merchants.get(merchant, 0.0) + amount)
         else:
             total_credit = _num(total_credit + amount)
+            # 退款冲抵消费（还款类 CREDIT 不是退款，只计入 total_credit）
+            if "还款" not in (t.get("merchant") or ""):
+                total_debit = _num(total_debit - amount)
     top_merchants = [
         {"merchant": name, "amount": amount}
         for name, amount in sorted(merchants.items(), key=lambda kv: kv[1], reverse=True)

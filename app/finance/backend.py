@@ -45,7 +45,17 @@ class FinanceBackend:
 
     async def _get_client(self):
         if self._client is None:
-            transport = StdioTransport(self.cmd[0], self.cmd[1:], cwd=self.credi_dir)
+            # FastMCP StdioTransport 不传 env 时子进程只拿到精简环境，会丢 DATABASE_URL；
+            # 这里显式继承当前环境并从 credi-insights/.env 兜底注入 DATABASE_URL（子进程连 MySQL 需要）。
+            env = dict(os.environ)
+            dotenv = os.path.join(self.credi_dir, ".env")
+            if "DATABASE_URL" not in env and os.path.exists(dotenv):
+                with open(dotenv, encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("DATABASE_URL="):
+                            env["DATABASE_URL"] = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            break
+            transport = StdioTransport(self.cmd[0], self.cmd[1:], cwd=self.credi_dir, env=env)
             self._client = Client(transport)
         if not self._entered and self._injected is None:
             # 注入的 client（测试）视为已就绪，不做上下文管理
