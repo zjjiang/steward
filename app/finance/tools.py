@@ -6,12 +6,12 @@
 
 import calendar
 import re
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from fastmcp.exceptions import ToolError
 
-from app.finance import analyze
+from app.finance import analyze, billing
 from app.finance.backend import get_backend
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -69,16 +69,25 @@ def _recent_months(n: int) -> list[str]:
     return sorted(out)
 
 
-async def fetch_transactions_range(be, start: str, end: str) -> list[dict]:
-    """[start, end] 日期窗口内的交易（内部统一形状）。
+def _today() -> date:
+    return datetime.now(TZ).date()
+
+
+async def fetch_transactions_range(
+    be, start: str, end: str, card_id: str | None = None
+) -> list[dict]:
+    """[start, end] 日期窗口内的交易（内部统一形状），可选限定单卡。
 
     上游 v1.1.0 的 get_transactions 只按月过滤（month 参数，limit 默认 50），
     这里按窗口展开涉及月份逐月拉取（limit=500，量级见 mod-finance design），
-    归一化后按日期过滤。
+    归一化后按日期过滤；card_id 非空时透传上游 cardId。
     """
     transactions: list[dict] = []
     for month in analyze.months_covering(start, end):
-        raw = await be.call("get_transactions", {"month": month, "limit": 500})
+        arguments: dict = {"month": month, "limit": 500}
+        if card_id:
+            arguments["cardId"] = card_id
+        raw = await be.call("get_transactions", arguments)
         transactions.extend(analyze.normalize_transactions(raw))
     return [t for t in transactions if start <= t["txDate"][:10] <= end]
 
@@ -88,26 +97,87 @@ async def _month_transactions(be, month: str) -> list[dict]:
     return await fetch_transactions_range(be, start, end)
 
 
+def _sorted_categories(by_category: dict) -> list[dict]:
+    """面向展示的形状：分类按金额降序列表。"""
+    return [
+        {"name": name, "amount": amount}
+        for name, amount in sorted(by_category.items(), key=lambda kv: kv[1], reverse=True)
+    ]
+
+
+async def build_card_bill(be, card_id: str, cycle: str | None = None, today: date | None = None) -> dict:
+    """单卡账单周期汇总（模块级 build_card_bill，MCP 工具与 web 共用）。
+
+    按卡的 billingDay 算出账单期窗口，取该期该卡交易做汇总与明细投影。
+    上游未返回 billingDay 时抛可读 ToolError，不按自然月兜底。
+    """
+    cards = await be.call("list_cards")
+    card = next((c for c in cards if c.get("id") == card_id), None)
+    if card is None:
+        raise ToolError(f"卡片不存在：{card_id}")
+    billing_day = card.get("billingDay")
+    if billing_day is None:
+        raise ToolError(
+            "上游未返回账单日（billingDay）——需要更新 credi-insights 的 "
+            "list_cards 输出（return 加 billingDay/dueDay）"
+        )
+    try:
+        bounds = billing.cycle_bounds(billing_day, cycle or "current", today or _today())
+    except ValueError as e:
+        raise ToolError(str(e))
+
+    transactions = await fetch_transactions_range(
+        be, bounds["start"], bounds["end"], card_id=card_id
+    )
+    summary = analyze.summarize_transactions(transactions)
+    items = [
+        {
+            "date": t.get("txDate", "")[:10],
+            "merchant": t.get("merchant", ""),
+            "amount": analyze._num(t.get("amount", 0)),
+            "category": (t.get("category") or {}).get("name") or "未分类",
+        }
+        for t in transactions
+    ]
+    return {
+        "card": {
+            "id": card.get("id"),
+            "bank": card.get("bank"),
+            "cardLast4": card.get("cardLast4"),
+            "alias": card.get("alias"),
+        },
+        "billing_day": billing_day,
+        "due_day": card.get("dueDay"),
+        "cycle": bounds["cycle"],
+        "statement_date": bounds["statement_date"],
+        "start": bounds["start"],
+        "end": bounds["end"],
+        "total_debit": summary["total_debit"],
+        "total_credit": summary["total_credit"],
+        "transaction_count": summary["transaction_count"],
+        "by_category": _sorted_categories(summary["by_category"]),
+        "items": items,
+    }
+
+
 def register_finance_tools(mcp) -> None:
 
     @mcp.tool
-    async def spending_summary(month: str | None = None) -> dict:
+    async def spending_summary(month: str | None = None, card_id: str | None = None) -> dict:
         """跨所有信用卡的月度消费汇总：总支出/总收入/笔数/分类占比/Top 5 商户。
 
         Args:
             month: 月份（YYYY-MM），缺省当月
+            card_id: 可选，仅统计某张卡（list_cards 返回的 id）
         """
         month = _validate_month(month)
         be = get_backend()
         start, end = _month_range(month)
-        summary = analyze.summarize_transactions(await fetch_transactions_range(be, start, end))
+        summary = analyze.summarize_transactions(
+            await fetch_transactions_range(be, start, end, card_id=card_id)
+        )
         # 面向龙虾的展示形状：分类按金额降序列表
-        summary["by_category"] = [
-            {"name": name, "amount": amount}
-            for name, amount in sorted(
-                summary["by_category"].items(), key=lambda kv: kv[1], reverse=True
-            )
-        ]
+        summary["by_category"] = _sorted_categories(summary["by_category"])
         return {"month": month, **summary}
 
     @mcp.tool
@@ -214,13 +284,26 @@ def register_finance_tools(mcp) -> None:
         return await get_backend().call("apply_rules", arguments)
 
     @mcp.tool
-    async def pending_classifications(date: str | None = None) -> dict:
+    async def pending_classifications(date: str | None = None, card_id: str | None = None) -> dict:
         """列出某日未分类交易（每日账单同步后，把规则没吃掉的列给用户确认）。
 
         Args:
             date: 日期（YYYY-MM-DD），缺省今天
+            card_id: 可选，仅看某张卡
         """
         day = _validate_day(date)
-        transactions = await fetch_transactions_range(get_backend(), day, day)
+        transactions = await fetch_transactions_range(get_backend(), day, day, card_id=card_id)
         items = analyze.filter_pending(transactions)
         return {"date": day, "count": len(items), "items": items}
+
+    @mcp.tool
+    async def card_bill(card_id: str, cycle: str | None = None) -> dict:
+        """单卡账单周期汇总：按账单日算周期（出账日→下个出账日前一日），
+        返回该期总支出/分类构成/明细与出账日、还款日。还款口径，与自然月工具并存。
+
+        Args:
+            card_id: list_cards 返回的卡片 id
+            cycle: current（最近已出账期，缺省）/ previous / YYYY-MM（出账月）
+        """
+        _require(card_id=card_id)
+        return await build_card_bill(get_backend(), card_id.strip(), cycle)
