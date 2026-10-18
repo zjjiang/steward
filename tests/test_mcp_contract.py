@@ -3,7 +3,7 @@
 覆盖成功路径与错误消息（对齐 Deputy 的 MCP 契约测试模式）。
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -682,3 +682,122 @@ class TestInsights:
         async with Client(mcp) as client:
             data = await call(client, "get_insights", {"ref_date": "2026-10-16"})
         assert data == {"items": []}
+
+
+# ---------- 卡级别透传与账单周期（add-card-bill-cycle） ----------
+
+
+class TestFinanceCardScoped:
+    async def test_summary_card_id_passthrough(self, isolated_db, finance_backend):
+        finance_backend.responses = {"get_transactions": []}
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            await call(client, "spending_summary", {"month": "2026-10", "card_id": "card_a"})
+        tool, args = finance_backend.calls[-1]
+        assert tool == "get_transactions"
+        assert args["cardId"] == "card_a"
+
+    async def test_summary_without_card_omits_cardid(self, isolated_db, finance_backend):
+        finance_backend.responses = {"get_transactions": []}
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            await call(client, "spending_summary", {"month": "2026-10"})
+        _, args = finance_backend.calls[-1]
+        assert "cardId" not in args
+
+    async def test_pending_card_id_passthrough(self, isolated_db, finance_backend):
+        finance_backend.responses = {"get_transactions": []}
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            await call(client, "pending_classifications", {"date": "2026-10-17", "card_id": "card_b"})
+        _, args = finance_backend.calls[-1]
+        assert args["cardId"] == "card_b"
+
+
+class TestCardBill:
+    async def test_current_bill(self, isolated_db, finance_backend, monkeypatch):
+        monkeypatch.setattr("app.finance.tools._today", lambda: date(2026, 10, 18))
+        finance_backend.responses = {
+            "list_cards": [
+                {"id": "card_a", "bank": "CMB", "cardLast4": "0094", "alias": "主卡",
+                 "isActive": True, "billingDay": 5, "dueDay": 23}
+            ],
+            # current（今天 10-18 ≥ 出账日 10-05）→ 窗口 10-05..11-04，跨 10、11 两月
+            "get_transactions": lambda a: (
+                [_fin_tx("t1", "美团", "28.00", "2026-10-06T00:00:00.000Z", category_id="cat1"),
+                 _fin_tx("t2", "地铁", "4.00", "2026-10-07T00:00:00.000Z")]
+                if a["month"] == "2026-10" and a.get("cardId") == "card_a"
+                else []
+            ),
+        }
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            data = await call(client, "card_bill", {"card_id": "card_a"})
+        assert data["cycle"] == "2026-10"
+        assert data["statement_date"] == "2026-10-05"
+        assert (data["start"], data["end"]) == ("2026-10-05", "2026-11-04")
+        assert data["billing_day"] == 5 and data["due_day"] == 23
+        assert data["card"] == {"id": "card_a", "bank": "CMB", "cardLast4": "0094", "alias": "主卡"}
+        assert data["total_debit"] == 32.0
+        assert data["transaction_count"] == 2
+        assert data["by_category"] == [{"name": "餐饮", "amount": 28.0}, {"name": "未分类", "amount": 4.0}]
+        assert {"date": "2026-10-07", "merchant": "地铁", "amount": 4.0, "category": "未分类"} in data["items"]
+
+    async def test_explicit_cycle_window(self, isolated_db, finance_backend):
+        finance_backend.responses = {
+            "list_cards": [
+                {"id": "card_a", "bank": "CMB", "cardLast4": "0094", "alias": None,
+                 "isActive": True, "billingDay": 5, "dueDay": 23}
+            ],
+            "get_transactions": lambda a: (
+                [_fin_tx("t9", "京东", "199.00", "2026-08-20T00:00:00.000Z", category_id="cat1")]
+                if a["month"] == "2026-08"
+                else []
+            ),
+        }
+        from fastmcp import Client
+
+        async with Client(mcp) as client:
+            data = await call(client, "card_bill", {"card_id": "card_a", "cycle": "2026-08"})
+        assert (data["start"], data["end"]) == ("2026-08-05", "2026-09-04")
+        assert data["total_debit"] == 199.0
+
+    async def test_missing_billing_day_degrades(self, isolated_db, finance_backend):
+        finance_backend.responses = {
+            "list_cards": [
+                {"id": "card_a", "bank": "CMB", "cardLast4": "0094", "alias": None, "isActive": True}
+            ],
+        }
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="账单日"):
+                await call(client, "card_bill", {"card_id": "card_a"})
+
+    async def test_card_not_found(self, isolated_db, finance_backend):
+        finance_backend.responses = {"list_cards": []}
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="card_x"):
+                await call(client, "card_bill", {"card_id": "card_x"})
+
+    async def test_bad_cycle_rejected(self, isolated_db, finance_backend):
+        finance_backend.responses = {
+            "list_cards": [
+                {"id": "card_a", "bank": "CMB", "cardLast4": "0094", "alias": None,
+                 "isActive": True, "billingDay": 5, "dueDay": 23}
+            ],
+        }
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        async with Client(mcp) as client:
+            with pytest.raises(ToolError, match="cycle"):
+                await call(client, "card_bill", {"card_id": "card_a", "cycle": "十月"})

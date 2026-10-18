@@ -214,3 +214,86 @@ class TestFinance:
         resp = client.get("/api/finance?month=2026-13")
         assert resp.status_code == 400
         assert "month" in resp.json()["detail"]
+
+
+# ---------- 卡级别与账单周期（add-card-bill-cycle） ----------
+
+
+class TestFinanceCardScoped:
+    @pytest.fixture
+    def fake_backend(self, monkeypatch):
+        class FakeFinanceBackend:
+            async def call(self, tool, arguments=None):
+                if tool == "list_cards":
+                    return [
+                        {"id": "card_a", "bank": "CMB", "cardLast4": "0094", "alias": "主卡",
+                         "isActive": True, "billingDay": 5, "dueDay": 23},
+                        {"id": "card_b", "bank": "SPDB", "cardLast4": "7788", "alias": None,
+                         "isActive": True, "billingDay": 15, "dueDay": 3},
+                    ]
+                if tool == "get_transactions":
+                    assert arguments.get("cardId"), "web 层按卡查询必须带 cardId"
+                    if arguments["month"] == "2026-10" and arguments["cardId"] == "card_a":
+                        return [_tx("2026-10-06", "美团", 28.0, "餐饮")]
+                    return []
+                raise AssertionError(f"未预期的工具调用 {tool}")
+
+        backend = FakeFinanceBackend()
+        monkeypatch.setattr("app.web.routes.get_backend", lambda: backend)
+        monkeypatch.setattr("app.web.routes._today", lambda: __import__("datetime").date(2026, 10, 18))
+        return backend
+
+    def test_finance_by_card(self, isolated_db, client, fake_backend):
+        resp = client.get("/api/finance?month=2026-10&card=card_a")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["available"] is True
+        assert data["summary"]["total_debit"] == 28.0
+
+    def test_bills_per_card(self, isolated_db, client, fake_backend):
+        resp = client.get("/api/bills")
+        assert resp.status_code == 200
+        bills = resp.json()["bills"]
+        assert len(bills) == 2
+        by_card = {b["card"]["id"]: b for b in bills}
+        a = by_card["card_a"]
+        assert a["cycle"] == "2026-10"  # 今天 10-18 ≥ 出账日 10-05
+        assert (a["start"], a["end"]) == ("2026-10-05", "2026-11-04")
+        assert a["total_debit"] == 28.0
+        assert a["due_day"] == 23
+        assert "error" not in a
+
+    def test_bill_single_card_failure_degrades(self, isolated_db, client, monkeypatch):
+        # card_b 缺 billingDay：该卡条目带 error，不影响 card_a
+        class PartialBackend:
+            async def call(self, tool, arguments=None):
+                if tool == "list_cards":
+                    return [
+                        {"id": "card_a", "bank": "CMB", "cardLast4": "0094", "alias": "主卡",
+                         "isActive": True, "billingDay": 5, "dueDay": 23},
+                        {"id": "card_b", "bank": "SPDB", "cardLast4": "7788", "alias": None,
+                         "isActive": True, "dueDay": 3},
+                    ]
+                if tool == "get_transactions":
+                    if arguments["month"] == "2026-10" and arguments["cardId"] == "card_a":
+                        return [_tx("2026-10-06", "美团", 28.0, "餐饮")]
+                    return []
+                raise AssertionError(f"未预期的工具调用 {tool}")
+
+        monkeypatch.setattr("app.web.routes.get_backend", lambda: PartialBackend())
+        monkeypatch.setattr(
+            "app.web.routes._today", lambda: __import__("datetime").date(2026, 10, 18)
+        )
+        resp = client.get("/api/bills")
+        assert resp.status_code == 200
+        bills = resp.json()["bills"]
+        assert len(bills) == 2
+        ok = [b for b in bills if "error" not in b]
+        bad = [b for b in bills if "error" in b]
+        assert len(ok) == 1 and ok[0]["card"]["id"] == "card_a"
+        assert len(bad) == 1 and "账单日" in bad[0]["error"]
+
+
+class FakeBackendBase:
+    async def call(self, tool, arguments=None):
+        raise NotImplementedError

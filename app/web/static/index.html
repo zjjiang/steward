@@ -97,7 +97,10 @@
     <div class="controls">
       <label class="muted">月份</label>
       <input type="month" id="finance-month">
+      <label class="muted">卡</label>
+      <select id="finance-card"><option value="">全部</option></select>
     </div>
+    <div id="bills-body"></div>
     <div id="finance-body"></div>
   </section>
 </main>
@@ -237,9 +240,33 @@ async function loadInsights(el) {
 }
 
 // ---------- 账单 ----------
+async function loadBills(el) {
+  // 各卡本期账单（还款口径：账单日→下个账单日）
+  const d = await getJson(`/api/bills`);
+  const bills = d.bills || [];
+  const cardsSel = $("#finance-card");
+  const current = cardsSel.value;
+  cardsSel.innerHTML = `<option value="">全部</option>` + bills
+    .filter((b) => !b.error)
+    .map((b) => `<option value="${b.card.id}">${b.card.bank}·${b.card.cardLast4}${b.card.alias ? `(${b.card.alias})` : ""}</option>`)
+    .join("");
+  cardsSel.value = current;  // 保留已选卡
+  if (!bills.length) { el.innerHTML = ""; return; }
+  el.innerHTML = bills.map((b) => {
+    if (b.error) {
+      return `<div class="card" style="flex-basis:100%"><h3>${b.card.bank || ""}·${b.card.cardLast4 || "?"}</h3><span class="muted">${b.error}</span></div>`;
+    }
+    const due = b.due_day ? `还款日 ${b.due_day} 号` : "还款日未知";
+    return `<div class="card"><h3>${b.card.bank}·${b.card.cardLast4}${b.card.alias ? ` ${b.card.alias}` : ""} 本期账单</h3>
+      <div class="big">${fmtMoney(b.total_debit)}</div>
+      <div class="sub">${b.start} ~ ${b.end} · ${b.transaction_count} 笔 · ${due}</div></div>`;
+  }).join("");
+}
+
 async function loadFinance(el) {
   const month = $("#finance-month").value;
-  const d = await getJson(`/api/finance?month=${month}`);
+  const card = $("#finance-card").value;
+  const d = await getJson(`/api/finance?month=${month}${card ? `&card=${card}` : ""}`);
   if (!d.available) {
     el.innerHTML = `<div class="error">财务数据不可用：${d.error}</div>`;
     return;
@@ -281,7 +308,10 @@ const LOADERS = {
   today: () => render(loadToday, $("#today-body")),
   review: () => render(loadReview, $("#review-body")),
   insights: () => render(loadInsights, $("#insights-body")),
-  finance: () => render(loadFinance, $("#finance-body")),
+  finance: async () => {  // 先拉卡清单（填充下拉），再按已选卡拉概况
+    await render(loadBills, $("#bills-body"));
+    await render(loadFinance, $("#finance-body"));
+  },
 };
 function switchTab(name) {
   document.querySelectorAll("nav button").forEach((b) =>
@@ -295,6 +325,7 @@ document.querySelectorAll("nav button").forEach((b) =>
 $("#today-date").addEventListener("change", () => LOADERS.today());
 $("#review-period").addEventListener("change", () => LOADERS.review());
 $("#finance-month").addEventListener("change", () => LOADERS.finance());
+$("#finance-card").addEventListener("change", () => LOADERS.finance());
 
 function todayIso() { return new Date().toLocaleDateString("sv-SE"); }
 function monthIso() { return todayIso().slice(0, 7); }

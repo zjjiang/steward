@@ -12,8 +12,10 @@ from app.finance.backend import get_backend
 from app.finance.tools import (
     _month_range,
     _recent_months,
+    _today,
     _validate_day,
     _validate_month,
+    build_card_bill,
     fetch_transactions_range,
 )
 from app.mcp_server import (
@@ -73,8 +75,8 @@ async def insights_view(ref_date: str | None = None):
 
 
 @router.get("/api/finance")
-async def finance_overview(month: str | None = None):
-    """月度账单概况：汇总 + 近 6 月趋势 + 订阅识别 + 当月待确认交易。"""
+async def finance_overview(month: str | None = None, card: str | None = None):
+    """月度账单概况：汇总 + 近 6 月趋势 + 订阅识别 + 当月待确认交易，可按卡过滤。"""
     try:
         month = _validate_month(month)
     except ToolError as e:
@@ -82,7 +84,7 @@ async def finance_overview(month: str | None = None):
     try:
         be = get_backend()
         start, end = _month_range(month)
-        transactions = await fetch_transactions_range(be, start, end)
+        transactions = await fetch_transactions_range(be, start, end, card_id=card)
         summary = analyze.summarize_transactions(transactions)
         summary = {
             **summary,
@@ -98,7 +100,7 @@ async def finance_overview(month: str | None = None):
         subs_transactions: list[dict] = []
         for m in _recent_months(TREND_MONTHS):
             m_start, m_end = _month_range(m)
-            m_txs = await fetch_transactions_range(be, m_start, m_end)
+            m_txs = await fetch_transactions_range(be, m_start, m_end, card_id=card)
             subs_transactions.extend(m_txs)
             m_summary = analyze.summarize_transactions(m_txs)
             trend.append(
@@ -112,6 +114,7 @@ async def finance_overview(month: str | None = None):
         pending = analyze.filter_pending(transactions)
         return {
             "month": month,
+            "card": card,
             "available": True,
             "summary": summary,
             "trend": analyze.compute_trend(trend),
@@ -120,3 +123,23 @@ async def finance_overview(month: str | None = None):
         }
     except ToolError as e:
         return {"available": False, "error": str(e)}
+
+
+@router.get("/api/bills")
+async def bills_overview(cycle: str | None = None):
+    """各卡账单周期汇总（最近已出账期，缺省）：单卡失败降级为条目级 error。"""
+    try:
+        be = get_backend()
+        cards = await be.call("list_cards")
+    except ToolError as e:
+        return {"available": False, "error": str(e)}
+    bills = []
+    for card in cards:
+        card_id = card.get("id")
+        try:
+            bills.append(await build_card_bill(be, card_id, cycle, today=_today()))
+        except ToolError as e:
+            bills.append({"card": {"id": card_id, "bank": card.get("bank"),
+                                   "cardLast4": card.get("cardLast4"), "alias": card.get("alias")},
+                          "error": str(e)})
+    return {"available": True, "bills": bills}
